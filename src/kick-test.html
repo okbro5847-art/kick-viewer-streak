@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Kick Sohbet Testi</title>
+  <style>
+    body { font: 16px/1.5 system-ui, sans-serif; max-width: 900px; margin: 32px auto; padding: 0 16px; }
+    #status { padding: 10px 12px; border: 1px solid #aaa; border-radius: 8px; }
+    #messages { padding-left: 20px; }
+    #messages li { margin: 6px 0; overflow-wrap: anywhere; }
+  </style>
+</head>
+<body>
+  <h1>Kick Sohbet Testi</h1>
+  <p id="status">Bağlantı başlatılıyor...</p>
+  <h2>Gelen mesajlar</h2>
+  <ol id="messages"></ol>
+  <script src="./kick-chat.js"></script>
+  <script>
+    const status = document.getElementById('status');
+    const messages = document.getElementById('messages');
+    const chat = new KickChat('simitciabdu');
+
+    chat.on('status', ({ state }) => {
+      const labels = {
+        resolving: 'Kanal bilgisi alınıyor...',
+        'discovering-connection': 'Kick bağlantı adresi alınıyor...',
+        'socket-open': 'Kick WebSocket açıldı; sohbete abone olunuyor...',
+        reconnecting: 'Bağlantı koptu; yeniden bağlanılıyor...',
+        'bridge-disconnected': 'Yerel köprü bağlantısı kapandı.',
+      };
+      status.textContent = labels[state] || `Durum: ${state}`;
+    });
+
+    chat.on('connected', ({ chatroomId }) => {
+      status.textContent = `Bağlandı! Chatroom ID: ${chatroomId}. Yeni sohbet mesajları bekleniyor.`;
+    });
+
+    chat.on('message', ({ author, text }) => {
+      const li = document.createElement('li');
+      const name = document.createElement('strong');
+      name.textContent = author + ': ';
+      li.append(name, document.createTextNode(text));
+      messages.appendChild(li);
+      while (messages.children.length > 100) messages.firstElementChild.remove();
+    });
+
+    chat.on('error', ({ message }) => {
+      status.textContent = 'Bağlantı hatası: ' + message;
+      console.error('KickChat:', message);
+    });
+
+    chat.connect();
+    window.addEventListener('beforeunload', () => chat.disconnect());
+  </script>
+</body>
+</html>
