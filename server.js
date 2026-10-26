@@ -6,7 +6,9 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { WebSocket, WebSocketServer } from 'ws';
 
-const PORT = Number(process.env.KICK_BRIDGE_PORT || 3001);
+const PORT = Number(
+  process.env.PORT || process.env.KICK_BRIDGE_PORT || 3001
+);
 const KICK_ORIGIN = 'https://kick.com';
 const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
@@ -78,14 +80,17 @@ function recordMessage(message) {
     viewer.days.sort();
   }
 
-  // Sohbet mesajı atılan ardışık günleri hesaplar.
   let streak = 0;
   const daySet = new Set(viewer.days);
   const cursor = new Date(`${date}T12:00:00+03:00`);
 
-  while (daySet.has(cursor.toLocaleDateString('en-CA', {
-    timeZone: 'Europe/Istanbul',
-  }))) {
+  while (
+    daySet.has(
+      cursor.toLocaleDateString('en-CA', {
+        timeZone: 'Europe/Istanbul',
+      })
+    )
+  ) {
     streak++;
     cursor.setDate(cursor.getDate() - 1);
   }
@@ -100,19 +105,27 @@ const httpServer = createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
 
   if (req.url === '/health') {
-    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+    res.writeHead(200, {
+      'content-type': 'application/json; charset=utf-8',
+    });
     res.end(JSON.stringify({ ok: true, service: 'kick-chat-bridge' }));
     return;
   }
 
   if (req.url === '/history') {
-    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+    res.writeHead(200, {
+      'content-type': 'application/json; charset=utf-8',
+    });
     res.end(JSON.stringify(Object.values(viewerHistory)));
     return;
   }
 
-  res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
-  res.end('Kick chat bridge is running. WebSocket endpoint: ws://localhost:' + PORT);
+  res.writeHead(404, {
+    'content-type': 'text/plain; charset=utf-8',
+  });
+  res.end(
+    `Kick chat bridge is running. WebSocket endpoint: ws://localhost:${PORT}`
+  );
 });
 
 const wss = new WebSocketServer({ server: httpServer });
@@ -143,12 +156,16 @@ async function getJson(url, options = {}) {
   try {
     body = JSON.parse(bodyText);
   } catch {
-    throw new Error(`Kick JSON olmayan veri döndürdü (HTTP ${response.status}).`);
+    throw new Error(
+      `Kick JSON olmayan veri döndürdü (HTTP ${response.status}).`
+    );
   }
 
   if (!response.ok) {
     throw new Error(
-      `Kick API HTTP ${response.status}: ${body?.message || body?.error || 'İstek reddedildi'}`
+      `Kick API HTTP ${response.status}: ${
+        body?.message || body?.error || 'İstek reddedildi'
+      }`
     );
   }
 
@@ -164,7 +181,9 @@ async function resolveChatroomId(slug) {
       const id = data?.chatroom?.id;
       if (id) return String(id);
     } catch (error) {
-      console.warn(`[Kick bridge] ${version} kanal araması başarısız: ${error.message}`);
+      console.warn(
+        `[Kick bridge] ${version} kanal araması başarısız: ${error.message}`
+      );
     }
   }
 
@@ -323,7 +342,9 @@ wss.on('connection', (client) => {
             message:
               typeof detail === 'string'
                 ? detail
-                : JSON.stringify(detail || { message: 'Pusher bağlantı hatası' }),
+                : JSON.stringify(
+                    detail || { message: 'Pusher bağlantı hatası' }
+                  ),
           });
           return;
         }
@@ -400,7 +421,9 @@ wss.on('connection', (client) => {
         upstream = null;
 
         console.warn(
-          `[Kick bridge] Bağlantı kapandı (${code}): ${reason.toString() || 'sebep yok'}`
+          `[Kick bridge] Bağlantı kapandı (${code}): ${
+            reason.toString() || 'sebep yok'
+          }`
         );
 
         send(client, 'status', { state: 'reconnecting' });
@@ -485,10 +508,15 @@ wss.on('connection', (client) => {
   client.on('error', stop);
 });
 
-loadViewerHistory().then(() => {
-  httpServer.listen(PORT, '127.0.0.1', () => {
-    console.log(`Kick bridge ready at http://127.0.0.1:${PORT}`);
-    console.log(`Health check: http://127.0.0.1:${PORT}/health`);
-    console.log(`Kayıtlı kullanıcı: ${Object.keys(viewerHistory).length}`);
+loadViewerHistory()
+  .then(() => {
+    httpServer.listen(PORT, '0.0.0.0', () => {
+      console.log(`Kick bridge ready on port ${PORT}`);
+      console.log('Health check: /health');
+      console.log(`Kayıtlı kullanıcı: ${Object.keys(viewerHistory).length}`);
+    });
+  })
+  .catch((error) => {
+    console.error('Sunucu başlatılamadı:', error);
+    process.exitCode = 1;
   });
-});
