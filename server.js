@@ -9,9 +9,12 @@ import { WebSocket, WebSocketServer } from 'ws';
 const PORT = Number(
   process.env.PORT || process.env.KICK_BRIDGE_PORT || 3001
 );
+
 const KICK_ORIGIN = 'https://kick.com';
+
 const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
+
 const RECONNECT_MS = 3000;
 const PING_MS = 25000;
 
@@ -36,6 +39,7 @@ async function loadViewerHistory() {
     if (error.code !== 'ENOENT') {
       console.error('Kayıt dosyası okunamadı:', error.message);
     }
+
     viewerHistory = {};
   }
 }
@@ -54,6 +58,7 @@ function saveViewerHistory() {
 
 function recordMessage(message) {
   const name = String(message.author || 'Anonymous').trim();
+
   if (!name || name === 'Anonymous') return;
 
   const key = name.toLowerCase();
@@ -71,6 +76,7 @@ function recordMessage(message) {
   }
 
   const viewer = viewerHistory[key];
+
   viewer.name = name;
   viewer.messages = (viewer.messages || 0) + 1;
   viewer.lastSeen = time;
@@ -103,19 +109,33 @@ function recordMessage(message) {
 
 const httpServer = createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Cache-Control', 'no-store');
 
-  if (req.url === '/health') {
+  const pathname = new URL(
+    req.url || '/',
+    `http://${req.headers.host || 'localhost'}`
+  ).pathname.replace(/\/+$/, '') || '/';
+
+  if (pathname === '/health') {
     res.writeHead(200, {
       'content-type': 'application/json; charset=utf-8',
     });
-    res.end(JSON.stringify({ ok: true, service: 'kick-chat-bridge' }));
+
+    res.end(
+      JSON.stringify({
+        ok: true,
+        service: 'kick-chat-bridge',
+      })
+    );
+
     return;
   }
 
-  if (req.url === '/history') {
+  if (pathname === '/history') {
     res.writeHead(200, {
       'content-type': 'application/json; charset=utf-8',
     });
+
     res.end(JSON.stringify(Object.values(viewerHistory)));
     return;
   }
@@ -123,6 +143,7 @@ const httpServer = createServer((req, res) => {
   res.writeHead(404, {
     'content-type': 'text/plain; charset=utf-8',
   });
+
   res.end(
     `Kick chat bridge is running. WebSocket endpoint: ws://localhost:${PORT}`
   );
@@ -178,7 +199,9 @@ async function resolveChatroomId(slug) {
       const data = await getJson(
         `https://kick.com/api/${version}/channels/${encodeURIComponent(slug)}`
       );
+
       const id = data?.chatroom?.id;
+
       if (id) return String(id);
     } catch (error) {
       console.warn(
@@ -208,9 +231,11 @@ async function discoverPusherUrl(clientId) {
   );
 
   const descriptor = response?.data || response;
+
   const connection = Array.isArray(descriptor?.connections)
     ? descriptor.connections.find((item) => item?.provider === 'pusher')
     : null;
+
   const credentials = connection?.credentials;
 
   if (
@@ -238,12 +263,14 @@ wss.on('connection', (client) => {
   const clearTimers = () => {
     if (pingTimer) clearInterval(pingTimer);
     if (reconnectTimer) clearTimeout(reconnectTimer);
+
     pingTimer = null;
     reconnectTimer = null;
   };
 
   const closeUpstream = () => {
     if (pingTimer) clearInterval(pingTimer);
+
     pingTimer = null;
 
     const old = upstream;
@@ -251,6 +278,7 @@ wss.on('connection', (client) => {
 
     if (old) {
       old.removeAllListeners('close');
+
       try {
         old.close();
       } catch {}
@@ -307,8 +335,14 @@ wss.on('connection', (client) => {
         if (pingTimer) clearInterval(pingTimer);
 
         pingTimer = setInterval(() => {
-          if (upstream === socket && socket.readyState === WebSocket.OPEN) {
-            socket.send(JSON.stringify({ event: 'pusher:ping', data: {} }));
+          if (
+            upstream === socket &&
+            socket.readyState === WebSocket.OPEN
+          ) {
+            socket.send(JSON.stringify({
+              event: 'pusher:ping',
+              data: {},
+            }));
           }
         }, PING_MS);
       });
@@ -346,16 +380,19 @@ wss.on('connection', (client) => {
                     detail || { message: 'Pusher bağlantı hatası' }
                   ),
           });
+
           return;
         }
 
         if (msg.event === 'pusher:connection_established') {
-          socket.send(
-            JSON.stringify({
-              event: 'pusher:subscribe',
-              data: { auth: '', channel: `chatrooms.${chatroomId}.v2` },
-            })
-          );
+          socket.send(JSON.stringify({
+            event: 'pusher:subscribe',
+            data: {
+              auth: '',
+              channel: `chatrooms.${chatroomId}.v2`,
+            },
+          }));
+
           return;
         }
 
@@ -369,7 +406,11 @@ wss.on('connection', (client) => {
         }
 
         if (msg.event === 'pusher:ping') {
-          socket.send(JSON.stringify({ event: 'pusher:pong', data: {} }));
+          socket.send(JSON.stringify({
+            event: 'pusher:pong',
+            data: {},
+          }));
+
           return;
         }
 
@@ -407,6 +448,7 @@ wss.on('connection', (client) => {
       socket.on('error', (error) => {
         if (upstream === socket && !stopped) {
           console.error('[Kick bridge] WebSocket hatası:', error.message);
+
           send(client, 'error', {
             message: `Kick WebSocket bağlantı hatası: ${error.message}`,
           });
@@ -417,6 +459,7 @@ wss.on('connection', (client) => {
         if (upstream !== socket || stopped) return;
 
         if (pingTimer) clearInterval(pingTimer);
+
         pingTimer = null;
         upstream = null;
 
@@ -483,6 +526,7 @@ wss.on('connection', (client) => {
     chatroomId = null;
 
     const myGeneration = generation;
+
     send(client, 'status', { state: 'resolving' });
 
     try {
@@ -497,6 +541,7 @@ wss.on('connection', (client) => {
       }
 
       console.log(`[Kick bridge] ${slug} => sohbet odası ${chatroomId}`);
+
       await connectUpstream();
     } catch (error) {
       console.error('[Kick bridge] Kanal bulunamadı:', error.message);
