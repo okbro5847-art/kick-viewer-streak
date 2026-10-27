@@ -1,5 +1,11 @@
 
 [[redirects]]
+  from = "/attendance/*"
+  to = "https://kick-viewer-streak.onrender.com/attendance/:splat"
+  status = 200
+  force = true
+
+[[redirects]]
   from = "/history"
   to = "https://kick-viewer-streak.onrender.com/history"
   status = 200
