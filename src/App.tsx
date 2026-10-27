@@ -1,9 +1,9 @@
-
 import { useEffect, useMemo, useState } from 'react';
 import {
   Activity, CalendarDays, ChevronLeft, ChevronRight, Download,
   Flame, LayoutDashboard, MessageCircle, Search, Settings2,
-  ShieldCheck, Trophy, Users, X
+  ShieldCheck, Trophy, Users, X, LockKeyhole, Play, Square,
+  RefreshCw, Clock3, LogOut, CheckCircle2, History as HistoryIcon
 } from 'lucide-react';
 
 type HistoryRecord = {
@@ -29,7 +29,28 @@ type Viewer = {
   color: string;
 };
 
-type Tab = 'overview' | 'attendance' | 'streaks' | 'activity' | 'settings';
+type AttendanceSession = {
+  id: string;
+  started_at: string;
+  stopped_at?: string | null;
+  active: boolean;
+  total: number;
+};
+
+type AttendanceStatus = {
+  active: boolean;
+  sessionId: string | null;
+  startedAt: string | null;
+  count: number;
+};
+
+type Tab =
+  | 'overview'
+  | 'attendance'
+  | 'liveAttendance'
+  | 'streaks'
+  | 'activity'
+  | 'settings';
 
 const monthNames = [
   'Ocak', 'Şubat', 'Mart', 'Nisan', 'Mayıs', 'Haziran',
@@ -40,7 +61,7 @@ const colors = ['#8b5cf6', '#0d9488', '#f59e0b', '#ec4899', '#3b82f6'];
 
 const fmt = (n: number) => new Intl.NumberFormat('tr-TR').format(n);
 
-function formatTime(value?: string) {
+function formatTime(value?: string | null) {
   if (!value) return '—';
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return '—';
@@ -51,7 +72,7 @@ function formatTime(value?: string) {
   });
 }
 
-function formatDate(value?: string) {
+function formatDate(value?: string | null) {
   if (!value) return '—';
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return '—';
@@ -63,8 +84,53 @@ function formatDate(value?: string) {
   });
 }
 
+async function apiRequest<T>(
+  path: string,
+  token?: string,
+  options: RequestInit = {}
+): Promise<T> {
+  const headers = new Headers(options.headers);
+  headers.set('Accept', 'application/json');
+
+  if (options.body) {
+    headers.set('Content-Type', 'application/json');
+  }
+
+  if (token) {
+    headers.set('Authorization', `Bearer ${token}`);
+  }
+
+  const response = await fetch(path, {
+    ...options,
+    headers,
+    cache: 'no-store'
+  });
+
+  const text = await response.text();
+  let data: any = {};
+
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    throw new Error(
+      'Sunucudan JSON yerine farklı bir yanıt geldi. API yönlendirmesini kontrol et.'
+    );
+  }
+
+  if (!response.ok) {
+    throw new Error(
+      typeof data.error === 'string'
+        ? data.error
+        : `Sunucu HTTP ${response.status} yanıtı verdi.`
+    );
+  }
+
+  return data as T;
+}
+
 function App() {
   const now = new Date();
+
   const [tab, setTab] = useState<Tab>('overview');
   const [records, setRecords] = useState<HistoryRecord[]>([]);
   const [search, setSearch] = useState('');
@@ -78,12 +144,31 @@ function App() {
   const [mobileNav, setMobileNav] = useState(false);
   const [selected, setSelected] = useState<Viewer | null>(null);
 
+  // Yoklama ekranı durumu
+  const [attendanceToken, setAttendanceToken] = useState('');
+  const [attendancePassword, setAttendancePassword] = useState('');
+  const [attendanceLoginLoading, setAttendanceLoginLoading] = useState(false);
+  const [attendanceBusy, setAttendanceBusy] = useState(false);
+  const [attendanceError, setAttendanceError] = useState('');
+  const [attendanceMessage, setAttendanceMessage] = useState('');
+  const [attendanceStatus, setAttendanceStatus] = useState<AttendanceStatus>({
+    active: false,
+    sessionId: null,
+    startedAt: null,
+    count: 0
+  });
+  const [attendanceUsers, setAttendanceUsers] = useState<string[]>([]);
+  const [attendanceSessions, setAttendanceSessions] = useState<AttendanceSession[]>([]);
+  const [attendanceLastUpdate, setAttendanceLastUpdate] = useState('');
+
+  // Mevcut izleyici geçmişi
   useEffect(() => {
     let alive = true;
 
     async function loadHistory() {
       try {
         const response = await fetch('/history', { cache: 'no-store' });
+
         if (!response.ok) {
           throw new Error(`Sunucu HTTP ${response.status} yanıtı verdi.`);
         }
@@ -118,6 +203,72 @@ function App() {
       window.clearInterval(timer);
     };
   }, []);
+
+  // Yoklama açıkken durumu ve katılımcıları düzenli yenile
+  useEffect(() => {
+    if (tab !== 'liveAttendance' || !attendanceToken) return;
+
+    let alive = true;
+    let busy = false;
+
+    async function refreshAttendance() {
+      if (busy) return;
+      busy = true;
+
+      try {
+        const [status, results, history] = await Promise.all([
+          apiRequest<AttendanceStatus>(
+            '/attendance/status',
+            attendanceToken
+          ),
+          apiRequest<{
+            total: number;
+            users: string[];
+            startedAt: string | null;
+            sessionId?: string;
+          }>(
+            '/attendance/results',
+            attendanceToken
+          ),
+          apiRequest<{ sessions: AttendanceSession[] }>(
+            '/attendance/history',
+            attendanceToken
+          )
+        ]);
+
+        if (!alive) return;
+
+        setAttendanceStatus(status);
+        setAttendanceUsers(Array.isArray(results.users) ? results.users : []);
+        setAttendanceSessions(
+          Array.isArray(history.sessions) ? history.sessions : []
+        );
+        setAttendanceLastUpdate(new Date().toLocaleTimeString('tr-TR'));
+        setAttendanceError('');
+      } catch (error) {
+        if (!alive) return;
+
+        setAttendanceError(
+          error instanceof Error
+            ? error.message
+            : 'Yoklama bilgileri alınamadı.'
+        );
+      } finally {
+        busy = false;
+      }
+    }
+
+    void refreshAttendance();
+
+    const timer = window.setInterval(() => {
+      void refreshAttendance();
+    }, 3000);
+
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+  }, [tab, attendanceToken]);
 
   const viewers = useMemo<Viewer[]>(() => {
     const monthPrefix = `${year}-${String(month + 1).padStart(2, '0')}-`;
@@ -157,6 +308,115 @@ function App() {
     window.setTimeout(() => setToast(''), 2800);
   };
 
+  const loginAttendance = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+
+    if (!attendancePassword.trim()) {
+      setAttendanceError('Lütfen yoklama şifresini gir.');
+      return;
+    }
+
+    setAttendanceLoginLoading(true);
+    setAttendanceError('');
+    setAttendanceMessage('');
+
+    try {
+      const result = await apiRequest<{ token: string }>(
+        '/attendance/login',
+        undefined,
+        {
+          method: 'POST',
+          body: JSON.stringify({ password: attendancePassword })
+        }
+      );
+
+      setAttendanceToken(result.token);
+      setAttendancePassword('');
+      setAttendanceError('');
+      setAttendanceMessage('Giriş başarılı. Yoklama paneli açıldı.');
+    } catch (error) {
+      setAttendanceError(
+        error instanceof Error ? error.message : 'Giriş yapılamadı.'
+      );
+    } finally {
+      setAttendanceLoginLoading(false);
+    }
+  };
+
+  const startAttendance = async () => {
+    setAttendanceBusy(true);
+    setAttendanceError('');
+    setAttendanceMessage('');
+
+    try {
+      const result = await apiRequest<{ message?: string }>(
+        '/attendance/start',
+        attendanceToken,
+        {
+          method: 'POST',
+          body: JSON.stringify({})
+        }
+      );
+
+      setAttendanceMessage(result.message || 'Yoklama başlatıldı.');
+      notify('Yoklama başladı.');
+    } catch (error) {
+      setAttendanceError(
+        error instanceof Error ? error.message : 'Yoklama başlatılamadı.'
+      );
+    } finally {
+      setAttendanceBusy(false);
+    }
+  };
+
+  const stopAttendance = async () => {
+    const confirmed = window.confirm(
+      'Yoklamayı bitirmek istediğine emin misin? Sonuçlar kaydedilmiş olarak kalacak.'
+    );
+
+    if (!confirmed) return;
+
+    setAttendanceBusy(true);
+    setAttendanceError('');
+    setAttendanceMessage('');
+
+    try {
+      const result = await apiRequest<{ message?: string }>(
+        '/attendance/stop',
+        attendanceToken,
+        {
+          method: 'POST',
+          body: JSON.stringify({})
+        }
+      );
+
+      setAttendanceMessage(result.message || 'Yoklama bitirildi.');
+      notify('Yoklama bitirildi.');
+    } catch (error) {
+      setAttendanceError(
+        error instanceof Error ? error.message : 'Yoklama bitirilemedi.'
+      );
+    } finally {
+      setAttendanceBusy(false);
+    }
+  };
+
+  const logoutAttendance = () => {
+    setAttendanceToken('');
+    setAttendancePassword('');
+    setAttendanceError('');
+    setAttendanceMessage('');
+    setAttendanceUsers([]);
+    setAttendanceSessions([]);
+    setAttendanceStatus({
+      active: false,
+      sessionId: null,
+      startedAt: null,
+      count: 0
+    });
+    notify('Yoklama panelinden çıkış yapıldı.');
+  };
+
   const downloadCsv = () => {
     const rows = [
       ['Kullanıcı', 'Bu ay katılım günü', 'Mevcut streak', 'En uzun streak', 'Mesaj sayısı', 'Son görülme'],
@@ -180,9 +440,33 @@ function App() {
     notify('CSV dosyası hazırlandı.');
   };
 
+  const downloadAttendanceCsv = () => {
+    const rows = [
+      ['Yoklama katılımcıları'],
+      ['Kullanıcı adı'],
+      ...attendanceUsers.map(name => [name])
+    ];
+
+    const csv = '\uFEFF' + rows
+      .map(row =>
+        row.map(value => `"${value.replaceAll('"', '""')}"`).join(';')
+      )
+      .join('\n');
+
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `yoklama-katilimcilari-${new Date().toISOString().slice(0, 10)}.csv`;
+    link.click();
+    URL.revokeObjectURL(url);
+    notify('Katılımcı listesi indirildi.');
+  };
+
   const navItems: { id: Tab; label: string; icon: typeof Users }[] = [
     { id: 'overview', label: 'Genel Bakış', icon: LayoutDashboard },
     { id: 'attendance', label: 'Aylık Yoklama', icon: CalendarDays },
+    { id: 'liveAttendance', label: 'Yoklama Vakti', icon: ShieldCheck },
     { id: 'streaks', label: 'Streak Sıralaması', icon: Trophy },
     { id: 'activity', label: 'Aktivite Akışı', icon: Activity },
     { id: 'settings', label: 'Ayarlar', icon: Settings2 }
@@ -202,6 +486,69 @@ function App() {
 
   return (
     <div className="app-shell">
+      <style>{`
+        .yv-page { animation: yvFadeIn .35s ease both; }
+        .yv-hero {
+          position: relative; overflow: hidden; padding: 28px;
+          border: 1px solid rgba(139,92,246,.25); border-radius: 22px;
+          background: radial-gradient(ellipse at 100% 0%, rgba(139,92,246,.19), transparent 48%),
+                      linear-gradient(135deg, rgba(24,24,40,.98), rgba(16,20,34,.98));
+          margin-bottom: 22px;
+        }
+        .yv-hero::after {
+          content: ''; position: absolute; width: 190px; height: 190px;
+          right: -55px; top: -70px; border-radius: 50%;
+          border: 1px solid rgba(167,139,250,.22);
+          box-shadow: 0 0 0 22px rgba(139,92,246,.035), 0 0 0 45px rgba(139,92,246,.025);
+          pointer-events: none;
+        }
+        .yv-eyebrow { color: #a78bfa; font-size: 11px; letter-spacing: 2px; font-weight: 800; }
+        .yv-title { font-size: clamp(27px, 4vw, 42px); margin: 10px 0; font-weight: 850; letter-spacing: -1.3px; }
+        .yv-gradient { background: linear-gradient(90deg,#c4b5fd,#818cf8,#5eead4); color: transparent; background-clip: text; }
+        .yv-subtitle { color: #a6a8ba; max-width: 620px; line-height: 1.7; font-size: 14px; }
+        .yv-layout { display: grid; grid-template-columns: minmax(0,1.5fr) minmax(260px,1fr); gap: 18px; }
+        .yv-card { border: 1px solid rgba(148,163,184,.15); border-radius: 18px; padding: 22px; background: rgba(20,24,39,.82); min-width: 0; }
+        .yv-card-title { display:flex; align-items:center; gap:9px; font-size:16px; font-weight:750; margin-bottom:7px; }
+        .yv-muted { color:#9ca3b8; font-size:13px; line-height:1.6; }
+        .yv-field { display:block; width:100%; box-sizing:border-box; border:1px solid rgba(148,163,184,.25); border-radius:12px; padding:13px 14px; color:#f8fafc; background:#111827; outline:none; margin:12px 0 15px; }
+        .yv-field:focus { border-color:#a78bfa; box-shadow:0 0 0 3px rgba(139,92,246,.15); }
+        .yv-btn { display:inline-flex; justify-content:center; align-items:center; gap:9px; border:0; border-radius:12px; padding:12px 16px; font-weight:750; cursor:pointer; transition:transform .2s, opacity .2s, box-shadow .2s; }
+        .yv-btn:hover { transform:translateY(-1px); }
+        .yv-btn:disabled { opacity:.5; cursor:not-allowed; transform:none; }
+        .yv-primary { color:white; background:linear-gradient(100deg,#7c3aed,#6366f1); box-shadow:0 7px 22px rgba(99,102,241,.18); }
+        .yv-stop { color:#fff; background:linear-gradient(100deg,#dc2626,#f43f5e); }
+        .yv-neutral { color:#e5e7eb; background:rgba(148,163,184,.12); border:1px solid rgba(148,163,184,.2); }
+        .yv-stat-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; margin:18px 0; }
+        .yv-stat { padding:17px; border:1px solid rgba(148,163,184,.15); border-radius:15px; background:rgba(15,23,42,.55); }
+        .yv-stat-value { font-size:clamp(23px,3vw,34px); font-weight:850; margin:8px 0 4px; letter-spacing:-1px; }
+        .yv-stat-label { font-size:12px; color:#a5b4c8; }
+        .yv-live-dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#34d399; margin-right:7px; animation:yvPulse 1.5s infinite; }
+        .yv-offline-dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#94a3b8; margin-right:7px; }
+        .yv-error { padding:12px 14px; border-radius:12px; margin:12px 0; color:#fecaca; background:rgba(127,29,29,.25); border:1px solid rgba(248,113,113,.22); font-size:13px; }
+        .yv-success { padding:12px 14px; border-radius:12px; margin:12px 0; color:#a7f3d0; background:rgba(6,95,70,.2); border:1px solid rgba(52,211,153,.2); font-size:13px; }
+        .yv-user-list { max-height:440px; overflow:auto; margin-top:15px; }
+        .yv-user-row { display:flex; align-items:center; gap:12px; padding:12px 3px; border-bottom:1px solid rgba(148,163,184,.1); animation:yvSlideIn .25s ease both; }
+        .yv-user-avatar { display:grid; place-items:center; flex:0 0 34px; width:34px; height:34px; border-radius:11px; color:#e9d5ff; background:linear-gradient(135deg,rgba(139,92,246,.3),rgba(59,130,246,.25)); font-weight:800; }
+        .yv-user-name { font-weight:700; overflow-wrap:anywhere; }
+        .yv-number { margin-left:auto; font-size:12px; color:#86efac; white-space:nowrap; }
+        .yv-empty { padding:28px 10px; text-align:center; color:#9ca3b8; }
+        .yv-session-row { display:flex; gap:12px; align-items:center; padding:14px 0; border-bottom:1px solid rgba(148,163,184,.1); }
+        .yv-session-row:last-child { border-bottom:0; }
+        .yv-session-date { font-weight:700; font-size:13px; }
+        .yv-session-meta { font-size:12px; color:#9ca3b8; margin-top:5px; }
+        .yv-session-count { margin-left:auto; font-size:13px; font-weight:800; white-space:nowrap; }
+        .yv-lock { width:54px; height:54px; display:grid; place-items:center; border-radius:17px; background:rgba(139,92,246,.16); color:#c4b5fd; margin-bottom:18px; }
+        .yv-status-chip { display:inline-flex; align-items:center; gap:7px; border-radius:999px; padding:7px 11px; font-size:11px; font-weight:800; letter-spacing:.5px; background:rgba(148,163,184,.1); color:#cbd5e1; }
+        .yv-status-chip.active { background:rgba(16,185,129,.12); color:#6ee7b7; }
+        .yv-actions { display:flex; gap:10px; flex-wrap:wrap; margin-top:18px; }
+        .yv-history-title { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:10px; }
+        @keyframes yvFadeIn { from {opacity:0; transform:translateY(8px)} to {opacity:1; transform:translateY(0)} }
+        @keyframes yvSlideIn { from {opacity:0; transform:translateX(-6px)} to {opacity:1; transform:translateX(0)} }
+        @keyframes yvPulse { 0%,100% {box-shadow:0 0 0 0 rgba(52,211,153,.45)} 50% {box-shadow:0 0 0 6px rgba(52,211,153,0)} }
+        @media(max-width:850px) { .yv-layout {grid-template-columns:1fr} }
+        @media(max-width:560px) { .yv-hero,.yv-card {padding:17px} .yv-stat-grid {grid-template-columns:1fr} .yv-actions .yv-btn {width:100%} }
+      `}</style>
+
       <aside className={`sidebar ${mobileNav ? 'sidebar-open' : ''}`}>
         <div className="brand">
           <div className="brand-mark"><Flame size={20} /></div>
@@ -220,10 +567,7 @@ function App() {
             <strong>SimitciAbdu</strong>
             <span>Kick kanalı</span>
           </div>
-          <span
-            className="status-dot"
-            title={connectionError ? 'Bağlantı hatası' : 'Geçmiş bağlantısı'}
-          />
+          <span className="status-dot" title={connectionError ? 'Bağlantı hatası' : 'Geçmiş bağlantısı'} />
         </div>
 
         <div className="nav-label">ÇALIŞMA ALANI</div>
@@ -244,6 +588,9 @@ function App() {
                 {item.id === 'attendance' && (
                   <span className="nav-count">{viewers.length}</span>
                 )}
+                {item.id === 'liveAttendance' && attendanceStatus.active && (
+                  <span className="nav-count">CANLI</span>
+                )}
               </button>
             );
           })}
@@ -254,12 +601,7 @@ function App() {
             <ShieldCheck size={17} />
             <span>Veriler yerel sohbet sunucusundan okunuyor.</span>
           </div>
-          <a
-            className="kick-link"
-            href="https://kick.com/simitciabdu"
-            target="_blank"
-            rel="noreferrer"
-          >
+          <a className="kick-link" href="https://kick.com/simitciabdu" target="_blank" rel="noreferrer">
             Kick kanalını aç
           </a>
           <div className="sidebar-foot">
@@ -269,9 +611,7 @@ function App() {
         </div>
       </aside>
 
-      {mobileNav && (
-        <button className="mobile-scrim" onClick={() => setMobileNav(false)} />
-      )}
+      {mobileNav && <button className="mobile-scrim" onClick={() => setMobileNav(false)} />}
 
       <main className="main-content">
         <header className="topbar">
@@ -347,9 +687,7 @@ function App() {
                   </div>
                 ))}
               </section>
-              <p className="disclaimer-line">
-                <Activity size={15} /> Son başarılı güncelleme: {lastUpdate || 'Henüz yok'}
-              </p>
+              <p className="disclaimer-line"><Activity size={15} /> Son başarılı güncelleme: {lastUpdate || 'Henüz yok'}</p>
             </>
           )}
 
@@ -422,6 +760,242 @@ function App() {
                 </div>
               </div>
             </>
+          )}
+
+          {tab === 'liveAttendance' && (
+            <div className="yv-page">
+              <div className="yv-hero">
+                <div className="yv-eyebrow">SİMİTÇİABDU · ÖZEL KONTROL PANELİ</div>
+                <h1 className="yv-title">YOKLAMA <span className="yv-gradient">VAKTİ.</span></h1>
+                <p className="yv-subtitle">
+                  Yoklamayı başlat, Kick sohbetine mesaj yazan katılımcıları canlı takip et.
+                  Her kullanıcı aynı oturumda yalnızca bir kez sayılır.
+                </p>
+              </div>
+
+              {!attendanceToken ? (
+                <div className="yv-layout">
+                  <section className="yv-card">
+                    <div className="yv-lock"><LockKeyhole size={27} /></div>
+                    <div className="yv-card-title">Yetkili girişi</div>
+                    <p className="yv-muted">
+                      Yoklama kontrol paneline erişmek için Render ortam değişkeninde
+                      tanımladığın şifreyi gir.
+                    </p>
+
+                    <form onSubmit={loginAttendance}>
+                      <label htmlFor="attendance-password" className="yv-muted">Yoklama şifresi</label>
+                      <input
+                        id="attendance-password"
+                        className="yv-field"
+                        type="password"
+                        autoComplete="current-password"
+                        value={attendancePassword}
+                        onChange={e => setAttendancePassword(e.target.value)}
+                        placeholder="Şifreni gir..."
+                        required
+                      />
+                      <button className="yv-btn yv-primary" type="submit" disabled={attendanceLoginLoading}>
+                        <LockKeyhole size={16} />
+                        {attendanceLoginLoading ? 'Kontrol ediliyor...' : 'Güvenli giriş'}
+                      </button>
+                    </form>
+
+                    {attendanceError && <div className="yv-error">{attendanceError}</div>}
+                  </section>
+
+                  <section className="yv-card">
+                    <div className="yv-card-title"><ShieldCheck size={19} /> Nasıl çalışır?</div>
+                    <p className="yv-muted">
+                      1. Şifrenle giriş yap.
+                    </p>
+                    <p className="yv-muted">
+                      2. Yoklama başlatıldığında sistem yeni mesajları izlemeye başlar.
+                    </p>
+                    <p className="yv-muted">
+                      3. Katılımcılar mesaj attıkça listeye eklenir.
+                    </p>
+                    <p className="yv-muted">
+                      4. Bitirdiğinde yoklama sonucu veritabanında kalır.
+                    </p>
+                    <div className="yv-success" style={{ marginTop: 18 }}>
+                      <CheckCircle2 size={15} style={{ verticalAlign: 'middle', marginRight: 7 }} />
+                      Şifre, tarayıcıya veya veritabanına kaydedilmez.
+                    </div>
+                  </section>
+                </div>
+              ) : (
+                <>
+                  <div className="yv-history-title">
+                    <div>
+                      <div className="yv-card-title">Yoklama kontrolü</div>
+                      <div className="yv-muted">Son güncelleme: {attendanceLastUpdate || 'Bekleniyor...'}</div>
+                    </div>
+                    <button className="yv-btn yv-neutral" onClick={logoutAttendance}>
+                      <LogOut size={15} /> Çıkış
+                    </button>
+                  </div>
+
+                  {attendanceError && <div className="yv-error">{attendanceError}</div>}
+                  {attendanceMessage && <div className="yv-success">{attendanceMessage}</div>}
+
+                  <div className="yv-layout">
+                    <section className="yv-card">
+                      <div className="yv-history-title">
+                        <div className="yv-card-title">
+                          <Activity size={19} />
+                          Canlı yoklama
+                        </div>
+                        <span className={`yv-status-chip ${attendanceStatus.active ? 'active' : ''}`}>
+                          {attendanceStatus.active
+                            ? <><span className="yv-live-dot" /> YOKLAMA AÇIK</>
+                            : <><span className="yv-offline-dot" /> YOKLAMA KAPALI</>}
+                        </span>
+                      </div>
+
+                      <div className="yv-stat-grid">
+                        <div className="yv-stat">
+                          <div className="yv-stat-label">Katılımcı sayısı</div>
+                          <div className="yv-stat-value yv-gradient">{fmt(attendanceUsers.length)}</div>
+                          <div className="yv-stat-label">Benzersiz kullanıcı</div>
+                        </div>
+                        <div className="yv-stat">
+                          <div className="yv-stat-label">Başlangıç saati</div>
+                          <div className="yv-stat-value" style={{ fontSize: 23 }}>
+                            {formatTime(attendanceStatus.startedAt)}
+                          </div>
+                          <div className="yv-stat-label">
+                            {formatDate(attendanceStatus.startedAt)}
+                          </div>
+                        </div>
+                        <div className="yv-stat">
+                          <div className="yv-stat-label">Durum</div>
+                          <div className="yv-stat-value" style={{ fontSize: 21 }}>
+                            {attendanceStatus.active ? 'CANLI' : 'HAZIR'}
+                          </div>
+                          <div className="yv-stat-label">Sunucu durumu</div>
+                        </div>
+                      </div>
+
+                      <div className="yv-actions">
+                        {!attendanceStatus.active ? (
+                          <button
+                            className="yv-btn yv-primary"
+                            onClick={startAttendance}
+                            disabled={attendanceBusy}
+                          >
+                            <Play size={16} />
+                            {attendanceBusy ? 'İşleniyor...' : 'Yoklamayı başlat'}
+                          </button>
+                        ) : (
+                          <button
+                            className="yv-btn yv-stop"
+                            onClick={stopAttendance}
+                            disabled={attendanceBusy}
+                          >
+                            <Square size={15} />
+                            {attendanceBusy ? 'İşleniyor...' : 'Yoklamayı bitir'}
+                          </button>
+                        )}
+
+                        <button
+                          className="yv-btn yv-neutral"
+                          onClick={() => window.location.reload()}
+                        >
+                          <RefreshCw size={15} /> Sayfayı yenile
+                        </button>
+
+                        <button
+                          className="yv-btn yv-neutral"
+                          onClick={downloadAttendanceCsv}
+                          disabled={attendanceUsers.length === 0}
+                        >
+                          <Download size={15} /> Listeyi indir
+                        </button>
+                      </div>
+
+                      <div className="yv-user-list">
+                        <div className="yv-card-title">
+                          <Users size={18} /> Katılımcılar
+                        </div>
+
+                        {attendanceUsers.length === 0 ? (
+                          <div className="yv-empty">
+                            <Users size={30} style={{ opacity: .45, marginBottom: 10 }} />
+                            <div>Henüz katılımcı yok.</div>
+                            <p className="yv-muted">
+                              Yoklama açıkken Kick sohbetine mesaj yazan kullanıcılar burada görünür.
+                            </p>
+                          </div>
+                        ) : (
+                          attendanceUsers.map((name, index) => (
+                            <div className="yv-user-row" key={`${name}-${index}`}>
+                              <div className="yv-user-avatar">
+                                {name.slice(0, 1).toUpperCase()}
+                              </div>
+                              <div className="yv-user-name">{name}</div>
+                              <div className="yv-number">
+                                <CheckCircle2 size={14} style={{ verticalAlign: 'middle', marginRight: 4 }} />
+                                Katıldı
+                              </div>
+                            </div>
+                          ))
+                        )}
+                      </div>
+                    </section>
+
+                    <section className="yv-card">
+                      <div className="yv-card-title">
+                        <HistoryIcon size={19} /> Yoklama geçmişi
+                      </div>
+                      <p className="yv-muted">
+                        Önceki yoklamaların başlangıç zamanları ve katılımcı sayıları.
+                        Kayıtlar veritabanından okunur.
+                      </p>
+
+                      <div style={{ marginTop: 16 }}>
+                        {attendanceSessions.length === 0 ? (
+                          <div className="yv-empty">
+                            <Clock3 size={28} style={{ opacity: .45, marginBottom: 10 }} />
+                            <div>Henüz geçmiş yoklama bulunmuyor.</div>
+                          </div>
+                        ) : (
+                          attendanceSessions.map(session => (
+                            <div className="yv-session-row" key={session.id}>
+                              <div>
+                                <div className="yv-session-date">
+                                  {formatDate(session.started_at)}
+                                </div>
+                                <div className="yv-session-meta">
+                                  Başlangıç: {formatTime(session.started_at)}
+                                  {' · '}
+                                  {session.active
+                                    ? 'Devam ediyor'
+                                    : `Bitiş: ${formatTime(session.stopped_at)}`}
+                                </div>
+                              </div>
+                              <div className="yv-session-count">
+                                {fmt(Number(session.total) || 0)} kişi
+                              </div>
+                            </div>
+                          ))
+                        )}
+                      </div>
+
+                      <div className="yv-success" style={{ marginTop: 20 }}>
+                        <ShieldCheck size={15} style={{ verticalAlign: 'middle', marginRight: 7 }} />
+                        Katılımcılar oturum başına kullanıcı adına göre tekilleştirilir.
+                      </div>
+                      <p className="yv-muted" style={{ marginTop: 14 }}>
+                        Not: Bu yöntem sessizce izleyenleri değil, yoklama açıkken sohbete
+                        mesaj atan kullanıcıları sayar. Yoklamayı başlatmadan önce Kick
+                        sohbet bağlantısının çalıştığından emin ol.
+                      </p>
+                    </section>
+                  </div>
+                </>
+              )}
+            </div>
           )}
 
           {tab === 'streaks' && (
