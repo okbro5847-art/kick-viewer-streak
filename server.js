@@ -20,6 +20,7 @@ const USER_AGENT =
 
 const RECONNECT_MS = 3000;
 const PING_MS = 25000;
+const ATTENDANCE_TOKEN_MS = 12 * 60 * 60 * 1000;
 
 const DATA_FILE = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -43,10 +44,56 @@ const pool = new Pool({
 let viewerHistory = {};
 let saveQueue = Promise.resolve();
 
+let attendance = null;
+const attendanceTokens = new Map();
+
 function today() {
   return new Date().toLocaleDateString('en-CA', {
     timeZone: 'Europe/Istanbul',
   });
+}
+
+function jsonResponse(res, status, data) {
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+  });
+
+  res.end(JSON.stringify(data));
+}
+
+async function readBody(req) {
+  let raw = '';
+
+  for await (const chunk of req) {
+    raw += chunk;
+
+    if (raw.length > 10000) {
+      throw new Error('İstek çok büyük.');
+    }
+  }
+
+  try {
+    return JSON.parse(raw || '{}');
+  } catch {
+    throw new Error('Geçersiz JSON.');
+  }
+}
+
+function authorized(req) {
+  const header = req.headers.authorization || '';
+
+  if (!header.startsWith('Bearer ')) return false;
+
+  const token = header.slice(7);
+  const expires = attendanceTokens.get(token);
+
+  if (!expires || expires < Date.now()) {
+    attendanceTokens.delete(token);
+    return false;
+  }
+
+  return true;
 }
 
 // Eski JSON dosyasını yalnızca veritabanı boşsa içe aktarır.
@@ -77,6 +124,7 @@ async function importOldJsonIfNeeded() {
     console.log(
       '[Database] İçe aktarılacak eski JSON dosyası bulunamadı.'
     );
+
     return;
   }
 
@@ -119,7 +167,6 @@ function saveViewer(key) {
 
   if (!viewer) return Promise.resolve();
 
-  // Kuyruğa girerken anlık kopya al.
   const snapshot = JSON.stringify(viewer);
 
   saveQueue = saveQueue
@@ -142,10 +189,30 @@ function saveViewer(key) {
   return saveQueue;
 }
 
+function recordAttendanceMessage(name) {
+  if (!attendance?.active) return;
+
+  const sessionId = attendance.id;
+  const username = name.toLowerCase();
+
+  void pool.query(
+    `INSERT INTO attendance_records
+       (session_id, username, display_name)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (session_id, username) DO NOTHING`,
+    [sessionId, username, name]
+  ).catch((error) => {
+    console.error('[Yoklama] Kullanıcı kaydedilemedi:', error.message);
+  });
+}
+
 function recordMessage(message) {
   const name = String(message.author || 'Anonymous').trim();
 
   if (!name || name === 'Anonymous') return;
+
+  // Yoklama açıksa kullanıcıyı yoklamaya da kaydet.
+  recordAttendanceMessage(name);
 
   const key = name.toLowerCase();
   const date = today();
@@ -197,35 +264,285 @@ function recordMessage(message) {
   void saveViewer(key);
 }
 
-const httpServer = createServer((req, res) => {
+// Yoklama API uçları.
+async function handleAttendance(req, res, pathname) {
+  if (
+    pathname === '/attendance/login' &&
+    req.method === 'POST'
+  ) {
+    let body;
+
+    try {
+      body = await readBody(req);
+    } catch (error) {
+      jsonResponse(res, 400, { error: error.message });
+      return true;
+    }
+
+    const password = process.env.ATTENDANCE_PASSWORD;
+
+    if (!password) {
+      jsonResponse(res, 500, {
+        error: 'ATTENDANCE_PASSWORD Render ayarlarında tanımlanmamış.',
+      });
+
+      return true;
+    }
+
+    if (
+      typeof body.password !== 'string' ||
+      body.password !== password
+    ) {
+      jsonResponse(res, 401, { error: 'Şifre yanlış.' });
+      return true;
+    }
+
+    const token = randomUUID();
+
+    attendanceTokens.set(
+      token,
+      Date.now() + ATTENDANCE_TOKEN_MS
+    );
+
+    jsonResponse(res, 200, {
+      token,
+      expiresIn: ATTENDANCE_TOKEN_MS,
+    });
+
+    return true;
+  }
+
+  if (!pathname.startsWith('/attendance/')) {
+    return false;
+  }
+
+  if (!authorized(req)) {
+    jsonResponse(res, 401, {
+      error: 'Oturum sona ermiş. Yeniden giriş yap.',
+    });
+
+    return true;
+  }
+
+  if (
+    pathname === '/attendance/status' &&
+    req.method === 'GET'
+  ) {
+    let count = 0;
+
+    if (attendance) {
+      const result = await pool.query(
+        `SELECT COUNT(*)::int AS count
+         FROM attendance_records
+         WHERE session_id = $1`,
+        [attendance.id]
+      );
+
+      count = result.rows[0].count;
+    }
+
+    jsonResponse(res, 200, {
+      active: Boolean(attendance?.active),
+      sessionId: attendance?.id || null,
+      startedAt: attendance?.startedAt || null,
+      count,
+    });
+
+    return true;
+  }
+
+  if (
+    pathname === '/attendance/start' &&
+    req.method === 'POST'
+  ) {
+    if (attendance?.active) {
+      jsonResponse(res, 409, {
+        error: 'Yoklama zaten açık.',
+      });
+
+      return true;
+    }
+
+    const id = randomUUID();
+    const startedAt = new Date().toISOString();
+
+    await pool.query(
+      `INSERT INTO attendance_sessions
+         (id, started_at, active)
+       VALUES ($1, $2, TRUE)`,
+      [id, startedAt]
+    );
+
+    attendance = {
+      id,
+      startedAt,
+      active: true,
+    };
+
+    jsonResponse(res, 200, {
+      ok: true,
+      message: 'Yoklama başladı.',
+      sessionId: id,
+      startedAt,
+    });
+
+    return true;
+  }
+
+  if (
+    pathname === '/attendance/stop' &&
+    req.method === 'POST'
+  ) {
+    if (!attendance?.active) {
+      jsonResponse(res, 409, {
+        error: 'Aktif yoklama bulunmuyor.',
+      });
+
+      return true;
+    }
+
+    await pool.query(
+      `UPDATE attendance_sessions
+       SET active = FALSE, stopped_at = NOW()
+       WHERE id = $1`,
+      [attendance.id]
+    );
+
+    attendance.active = false;
+
+    jsonResponse(res, 200, {
+      ok: true,
+      message: 'Yoklama bitirildi.',
+    });
+
+    return true;
+  }
+
+  if (
+    pathname === '/attendance/results' &&
+    req.method === 'GET'
+  ) {
+    const sessionResult = attendance
+      ? {
+          rows: [{
+            id: attendance.id,
+            started_at: attendance.startedAt,
+          }],
+        }
+      : await pool.query(
+          `SELECT id, started_at
+           FROM attendance_sessions
+           ORDER BY started_at DESC
+           LIMIT 1`
+        );
+
+    if (!sessionResult.rows.length) {
+      jsonResponse(res, 200, {
+        total: 0,
+        users: [],
+        startedAt: null,
+      });
+
+      return true;
+    }
+
+    const session = sessionResult.rows[0];
+
+    const usersResult = await pool.query(
+      `SELECT display_name, username
+       FROM attendance_records
+       WHERE session_id = $1
+       ORDER BY display_name`,
+      [session.id]
+    );
+
+    jsonResponse(res, 200, {
+      sessionId: session.id,
+      startedAt: session.started_at,
+      total: usersResult.rows.length,
+      users: usersResult.rows.map((row) => row.display_name),
+    });
+
+    return true;
+  }
+
+  if (
+    pathname === '/attendance/history' &&
+    req.method === 'GET'
+  ) {
+    const sessions = await pool.query(
+      `SELECT
+         s.id,
+         s.started_at,
+         s.stopped_at,
+         s.active,
+         COUNT(r.username)::int AS total
+       FROM attendance_sessions s
+       LEFT JOIN attendance_records r ON r.session_id = s.id
+       GROUP BY s.id
+       ORDER BY s.started_at DESC`
+    );
+
+    jsonResponse(res, 200, { sessions: sessions.rows });
+    return true;
+  }
+
+  jsonResponse(res, 404, {
+    error: 'Yoklama adresi bulunamadı.',
+  });
+
+  return true;
+}
+
+const httpServer = createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader(
+    'Access-Control-Allow-Methods',
+    'GET, POST, OPTIONS'
+  );
+  res.setHeader(
+    'Access-Control-Allow-Headers',
+    'Content-Type, Authorization'
+  );
   res.setHeader('Cache-Control', 'no-store');
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
 
   const pathname = new URL(
     req.url || '/',
     `http://${req.headers.host || 'localhost'}`
   ).pathname.replace(/\/+$/, '') || '/';
 
-  if (pathname === '/health') {
-    res.writeHead(200, {
-      'content-type': 'application/json; charset=utf-8',
+  try {
+    if (await handleAttendance(req, res, pathname)) {
+      return;
+    }
+  } catch (error) {
+    console.error('[Yoklama API]', error);
+
+    jsonResponse(res, 500, {
+      error: 'Sunucu hatası oluştu.',
     });
 
-    res.end(JSON.stringify({
+    return;
+  }
+
+  if (pathname === '/health') {
+    jsonResponse(res, 200, {
       ok: true,
       service: 'kick-chat-bridge',
       database: true,
-    }));
+    });
 
     return;
   }
 
   if (pathname === '/history') {
-    res.writeHead(200, {
-      'content-type': 'application/json; charset=utf-8',
-    });
-
-    res.end(JSON.stringify(Object.values(viewerHistory)));
+    jsonResponse(res, 200, Object.values(viewerHistory));
     return;
   }
 
@@ -299,7 +616,9 @@ async function resolveChatroomId(slug) {
     }
   }
 
-  if (slug.toLowerCase() === 'simitciabdu') return '1335964';
+  if (slug.toLowerCase() === 'simitciabdu') {
+    return '1335964';
+  }
 
   throw new Error('Sohbet odası kimliği alınamadı.');
 }
@@ -322,7 +641,9 @@ async function discoverPusherUrl(clientId) {
   const descriptor = response?.data || response;
 
   const connection = Array.isArray(descriptor?.connections)
-    ? descriptor.connections.find((item) => item?.provider === 'pusher')
+    ? descriptor.connections.find(
+        (item) => item?.provider === 'pusher'
+      )
     : null;
 
   const credentials = connection?.credentials;
@@ -334,7 +655,9 @@ async function discoverPusherUrl(clientId) {
     typeof credentials?.cluster !== 'string' ||
     !/^[a-z0-9-]+$/.test(credentials.cluster)
   ) {
-    throw new Error('Kick geçerli Pusher bağlantı bilgisi döndürmedi.');
+    throw new Error(
+      'Kick geçerli Pusher bağlantı bilgisi döndürmedi.'
+    );
   }
 
   return `wss://ws-${credentials.cluster}.pusher.com/app/${credentials.app_key}?protocol=7&client=js&version=7.4.0&flash=false`;
@@ -393,7 +716,9 @@ wss.on('connection', (client) => {
       return;
     }
 
-    send(client, 'status', { state: 'discovering-connection' });
+    send(client, 'status', {
+      state: 'discovering-connection',
+    });
 
     try {
       const socketUrl = await discoverPusherUrl(randomUUID());
@@ -406,7 +731,9 @@ wss.on('connection', (client) => {
         return;
       }
 
-      console.log(`[Kick bridge] Kanal: ${channelSlug} / oda: ${chatroomId}`);
+      console.log(
+        `[Kick bridge] Kanal: ${channelSlug} / oda: ${chatroomId}`
+      );
 
       const socket = new WebSocket(socketUrl, {
         origin: KICK_ORIGIN,
@@ -419,6 +746,7 @@ wss.on('connection', (client) => {
         if (upstream !== socket || stopped) return;
 
         console.log('[Kick bridge] Kick bağlantısı açıldı.');
+
         send(client, 'status', { state: 'socket-open' });
 
         if (pingTimer) clearInterval(pingTimer);
@@ -466,7 +794,9 @@ wss.on('connection', (client) => {
               typeof detail === 'string'
                 ? detail
                 : JSON.stringify(
-                    detail || { message: 'Pusher bağlantı hatası' }
+                    detail || {
+                      message: 'Pusher bağlantı hatası',
+                    }
                   ),
           });
 
@@ -490,6 +820,7 @@ wss.on('connection', (client) => {
           msg.channel === `chatrooms.${chatroomId}.v2`
         ) {
           console.log('[Kick bridge] Sohbet aboneliği başarılı.');
+
           send(client, 'connected', { chatroomId });
           return;
         }
@@ -536,7 +867,10 @@ wss.on('connection', (client) => {
 
       socket.on('error', (error) => {
         if (upstream === socket && !stopped) {
-          console.error('[Kick bridge] WebSocket hatası:', error.message);
+          console.error(
+            '[Kick bridge] WebSocket hatası:',
+            error.message
+          );
 
           send(client, 'error', {
             message: `Kick WebSocket bağlantı hatası: ${error.message}`,
@@ -560,7 +894,10 @@ wss.on('connection', (client) => {
 
         send(client, 'status', { state: 'reconnecting' });
 
-        if (!reconnectTimer && client.readyState === WebSocket.OPEN) {
+        if (
+          !reconnectTimer &&
+          client.readyState === WebSocket.OPEN
+        ) {
           reconnectTimer = setTimeout(() => {
             reconnectTimer = null;
             connectUpstream();
@@ -568,7 +905,11 @@ wss.on('connection', (client) => {
         }
       });
     } catch (error) {
-      console.error('[Kick bridge] Bağlantı kurulamadı:', error.message);
+      console.error(
+        '[Kick bridge] Bağlantı kurulamadı:',
+        error.message
+      );
+
       send(client, 'error', { message: error.message });
 
       if (
@@ -602,10 +943,15 @@ wss.on('connection', (client) => {
 
     if (request.type !== 'connect') return;
 
-    const slug = String(request.channel || '').trim().toLowerCase();
+    const slug = String(request.channel || '')
+      .trim()
+      .toLowerCase();
 
     if (!/^[a-z0-9_]+$/.test(slug)) {
-      send(client, 'error', { message: 'Geçersiz Kick kanal adı.' });
+      send(client, 'error', {
+        message: 'Geçersiz Kick kanal adı.',
+      });
+
       return;
     }
 
@@ -629,11 +975,17 @@ wss.on('connection', (client) => {
         return;
       }
 
-      console.log(`[Kick bridge] ${slug} => sohbet odası ${chatroomId}`);
+      console.log(
+        `[Kick bridge] ${slug} => sohbet odası ${chatroomId}`
+      );
 
       await connectUpstream();
     } catch (error) {
-      console.error('[Kick bridge] Kanal bulunamadı:', error.message);
+      console.error(
+        '[Kick bridge] Kanal bulunamadı:',
+        error.message
+      );
+
       send(client, 'error', { message: error.message });
     }
   });
@@ -650,13 +1002,54 @@ async function startServer() {
     )
   `);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS attendance_sessions (
+      id UUID PRIMARY KEY,
+      started_at TIMESTAMPTZ NOT NULL,
+      stopped_at TIMESTAMPTZ,
+      active BOOLEAN NOT NULL DEFAULT FALSE
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS attendance_records (
+      session_id UUID NOT NULL REFERENCES attendance_sessions(id),
+      username TEXT NOT NULL,
+      display_name TEXT NOT NULL,
+      PRIMARY KEY (session_id, username)
+    )
+  `);
+
   await importOldJsonIfNeeded();
   await loadViewerHistory();
+
+  // Sunucu yeniden başlarsa açık yoklamayı geri yükle.
+  const activeSession = await pool.query(
+    `SELECT id, started_at
+     FROM attendance_sessions
+     WHERE active = TRUE
+     ORDER BY started_at DESC
+     LIMIT 1`
+  );
+
+  if (activeSession.rows.length) {
+    const row = activeSession.rows[0];
+
+    attendance = {
+      id: row.id,
+      startedAt: row.started_at,
+      active: true,
+    };
+
+    console.log('[Yoklama] Açık yoklama geri yüklendi.');
+  }
 
   httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`Kick bridge ready on port ${PORT}`);
     console.log('Health check: /health');
-    console.log(`Veritabanındaki kullanıcı: ${Object.keys(viewerHistory).length}`);
+    console.log(
+      `Veritabanındaki kullanıcı: ${Object.keys(viewerHistory).length}`
+    );
   });
 }
 
