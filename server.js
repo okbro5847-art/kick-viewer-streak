@@ -1,10 +1,13 @@
 
 import { createServer } from 'node:http';
 import { randomUUID } from 'node:crypto';
-import { readFile, writeFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { WebSocket, WebSocketServer } from 'ws';
+import pg from 'pg';
+
+const { Pool } = pg;
 
 const PORT = Number(
   process.env.PORT || process.env.KICK_BRIDGE_PORT || 3001
@@ -23,6 +26,20 @@ const DATA_FILE = path.join(
   'viewer-history.json'
 );
 
+if (!process.env.DATABASE_URL) {
+  throw new Error(
+    'DATABASE_URL bulunamadı. Render Environment ayarını kontrol et.'
+  );
+}
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+  max: 5,
+  connectionTimeoutMillis: 15000,
+  idleTimeoutMillis: 30000,
+});
+
 let viewerHistory = {};
 let saveQueue = Promise.resolve();
 
@@ -32,25 +49,94 @@ function today() {
   });
 }
 
-async function loadViewerHistory() {
+// Eski JSON dosyasını yalnızca veritabanı boşsa içe aktarır.
+async function importOldJsonIfNeeded() {
+  const result = await pool.query(
+    'SELECT COUNT(*)::int AS count FROM viewer_history'
+  );
+
+  if (result.rows[0].count > 0) {
+    console.log(
+      '[Database] Mevcut kayıtlar bulundu; eski dosya içe aktarılmadı.'
+    );
+    return;
+  }
+
+  let oldHistory;
+
   try {
-    viewerHistory = JSON.parse(await readFile(DATA_FILE, 'utf8'));
+    oldHistory = JSON.parse(await readFile(DATA_FILE, 'utf8'));
   } catch (error) {
     if (error.code !== 'ENOENT') {
-      console.error('Kayıt dosyası okunamadı:', error.message);
+      console.error(
+        '[Database] Eski JSON okunamadı:',
+        error.message
+      );
     }
 
-    viewerHistory = {};
+    console.log(
+      '[Database] İçe aktarılacak eski JSON dosyası bulunamadı.'
+    );
+    return;
   }
+
+  let imported = 0;
+
+  for (const [key, viewer] of Object.entries(oldHistory)) {
+    if (!viewer || typeof viewer !== 'object') continue;
+
+    await pool.query(
+      `INSERT INTO viewer_history (viewer_key, data)
+       VALUES ($1, $2::jsonb)
+       ON CONFLICT (viewer_key) DO NOTHING`,
+      [key, JSON.stringify(viewer)]
+    );
+
+    imported++;
+  }
+
+  console.log(`[Database] Eski JSON'dan aktarılan kayıt: ${imported}`);
 }
 
-function saveViewerHistory() {
+async function loadViewerHistory() {
+  const result = await pool.query(
+    'SELECT viewer_key, data FROM viewer_history'
+  );
+
+  viewerHistory = {};
+
+  for (const row of result.rows) {
+    viewerHistory[row.viewer_key] = row.data;
+  }
+
+  console.log(
+    `[Database] Yüklenen kullanıcı sayısı: ${result.rows.length}`
+  );
+}
+
+function saveViewer(key) {
+  const viewer = viewerHistory[key];
+
+  if (!viewer) return Promise.resolve();
+
+  // Kuyruğa girerken anlık kopya al.
+  const snapshot = JSON.stringify(viewer);
+
   saveQueue = saveQueue
     .then(() =>
-      writeFile(DATA_FILE, JSON.stringify(viewerHistory, null, 2), 'utf8')
+      pool.query(
+        `INSERT INTO viewer_history (viewer_key, data)
+         VALUES ($1, $2::jsonb)
+         ON CONFLICT (viewer_key)
+         DO UPDATE SET data = EXCLUDED.data`,
+        [key, snapshot]
+      )
     )
     .catch((error) => {
-      console.error('Kayıt dosyası yazılamadı:', error.message);
+      console.error(
+        '[Database] Kullanıcı kaydı kaydedilemedi:',
+        error.message
+      );
     });
 
   return saveQueue;
@@ -81,6 +167,10 @@ function recordMessage(message) {
   viewer.messages = (viewer.messages || 0) + 1;
   viewer.lastSeen = time;
 
+  if (!Array.isArray(viewer.days)) {
+    viewer.days = [];
+  }
+
   if (!viewer.days.includes(date)) {
     viewer.days.push(date);
     viewer.days.sort();
@@ -104,7 +194,7 @@ function recordMessage(message) {
   viewer.streak = streak;
   viewer.best = Math.max(viewer.best || 0, streak);
 
-  void saveViewerHistory();
+  void saveViewer(key);
 }
 
 const httpServer = createServer((req, res) => {
@@ -121,12 +211,11 @@ const httpServer = createServer((req, res) => {
       'content-type': 'application/json; charset=utf-8',
     });
 
-    res.end(
-      JSON.stringify({
-        ok: true,
-        service: 'kick-chat-bridge',
-      })
-    );
+    res.end(JSON.stringify({
+      ok: true,
+      service: 'kick-chat-bridge',
+      database: true,
+    }));
 
     return;
   }
@@ -553,15 +642,43 @@ wss.on('connection', (client) => {
   client.on('error', stop);
 });
 
-loadViewerHistory()
-  .then(() => {
-    httpServer.listen(PORT, '0.0.0.0', () => {
-      console.log(`Kick bridge ready on port ${PORT}`);
-      console.log('Health check: /health');
-      console.log(`Kayıtlı kullanıcı: ${Object.keys(viewerHistory).length}`);
-    });
-  })
-  .catch((error) => {
-    console.error('Sunucu başlatılamadı:', error);
-    process.exitCode = 1;
+async function startServer() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS viewer_history (
+      viewer_key TEXT PRIMARY KEY,
+      data JSONB NOT NULL
+    )
+  `);
+
+  await importOldJsonIfNeeded();
+  await loadViewerHistory();
+
+  httpServer.listen(PORT, '0.0.0.0', () => {
+    console.log(`Kick bridge ready on port ${PORT}`);
+    console.log('Health check: /health');
+    console.log(`Veritabanındaki kullanıcı: ${Object.keys(viewerHistory).length}`);
   });
+}
+
+startServer().catch((error) => {
+  console.error('[Database] Sunucu başlatılamadı:', error);
+  process.exitCode = 1;
+});
+
+async function shutdown() {
+  console.log('Sunucu kapatılıyor...');
+
+  try {
+    await saveQueue;
+    await pool.end();
+  } catch (error) {
+    console.error('Kapatma hatası:', error.message);
+  }
+
+  httpServer.close(() => {
+    process.exit(0);
+  });
+}
+
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
