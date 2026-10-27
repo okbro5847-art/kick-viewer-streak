@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   Activity, CalendarDays, ChevronLeft, ChevronRight, Download,
   Flame, LayoutDashboard, MessageCircle, Search, Settings2,
@@ -63,8 +63,11 @@ const fmt = (n: number) => new Intl.NumberFormat('tr-TR').format(n);
 
 function formatTime(value?: string | null) {
   if (!value) return '—';
+
   const date = new Date(value);
+
   if (Number.isNaN(date.getTime())) return '—';
+
   return date.toLocaleTimeString('tr-TR', {
     hour: '2-digit',
     minute: '2-digit',
@@ -74,8 +77,11 @@ function formatTime(value?: string | null) {
 
 function formatDate(value?: string | null) {
   if (!value) return '—';
+
   const date = new Date(value);
+
   if (Number.isNaN(date.getTime())) return '—';
+
   return date.toLocaleDateString('tr-TR', {
     day: 'numeric',
     month: 'short',
@@ -90,6 +96,7 @@ async function apiRequest<T>(
   options: RequestInit = {}
 ): Promise<T> {
   const headers = new Headers(options.headers);
+
   headers.set('Accept', 'application/json');
 
   if (options.body) {
@@ -144,6 +151,12 @@ function App() {
   const [mobileNav, setMobileNav] = useState(false);
   const [selected, setSelected] = useState<Viewer | null>(null);
 
+  // Canlı Kick bağlantısının durumu
+  const [kickConnected, setKickConnected] = useState(false);
+  const [kickConnectionMessage, setKickConnectionMessage] = useState(
+    'Kick bağlantısı bekleniyor...'
+  );
+
   // Yoklama ekranı durumu
   const [attendanceToken, setAttendanceToken] = useState('');
   const [attendancePassword, setAttendancePassword] = useState('');
@@ -151,23 +164,27 @@ function App() {
   const [attendanceBusy, setAttendanceBusy] = useState(false);
   const [attendanceError, setAttendanceError] = useState('');
   const [attendanceMessage, setAttendanceMessage] = useState('');
+
   const [attendanceStatus, setAttendanceStatus] = useState<AttendanceStatus>({
     active: false,
     sessionId: null,
     startedAt: null,
     count: 0
   });
+
   const [attendanceUsers, setAttendanceUsers] = useState<string[]>([]);
   const [attendanceSessions, setAttendanceSessions] = useState<AttendanceSession[]>([]);
   const [attendanceLastUpdate, setAttendanceLastUpdate] = useState('');
 
-  // Mevcut izleyici geçmişi
+  // Geçmiş kayıtlarını yükle ve her 5 saniyede bir yenile.
   useEffect(() => {
     let alive = true;
 
     async function loadHistory() {
       try {
-        const response = await fetch('/history', { cache: 'no-store' });
+        const response = await fetch('/history', {
+          cache: 'no-store'
+        });
 
         if (!response.ok) {
           throw new Error(`Sunucu HTTP ${response.status} yanıtı verdi.`);
@@ -188,15 +205,21 @@ function App() {
       } catch (error) {
         if (alive) {
           setConnectionError(
-            error instanceof Error ? error.message : 'Bağlantı kurulamadı.'
+            error instanceof Error
+              ? error.message
+              : 'Bağlantı kurulamadı.'
           );
+
           setLoading(false);
         }
       }
     }
 
     void loadHistory();
-    const timer = window.setInterval(() => void loadHistory(), 5000);
+
+    const timer = window.setInterval(() => {
+      void loadHistory();
+    }, 5000);
 
     return () => {
       alive = false;
@@ -204,7 +227,185 @@ function App() {
     };
   }, []);
 
-  // Yoklama açıkken durumu ve katılımcıları düzenli yenile
+  // CANLI KICK BAĞLANTISI
+  // Sunucudaki WebSocket üzerinden simitciabdu kanalına bağlanır.
+  // Tasarıma, geçmiş kayıtlarına ve veritabanına müdahale etmez.
+  useEffect(() => {
+    let stopped = false;
+    let socket: WebSocket | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let reconnectDelay = 5000;
+
+    const clearReconnectTimer = () => {
+      if (reconnectTimer !== null) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+    };
+
+    const scheduleReconnect = () => {
+      if (stopped || reconnectTimer !== null) return;
+
+      setKickConnected(false);
+      setKickConnectionMessage('Yeniden bağlanılıyor...');
+
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        connect();
+      }, reconnectDelay);
+
+      reconnectDelay = Math.min(reconnectDelay * 1.5, 30000);
+    };
+
+    const connect = () => {
+      if (stopped) return;
+
+      clearReconnectTimer();
+
+      setKickConnected(false);
+      setKickConnectionMessage('Kick sunucusuna bağlanılıyor...');
+
+      try {
+        // Render üzerindeki WebSocket sunucusu.
+        const ws = new WebSocket(
+          'wss://kick-viewer-streak.onrender.com'
+        );
+
+        socket = ws;
+
+        ws.onopen = () => {
+          if (stopped || socket !== ws) return;
+
+          setKickConnectionMessage('Kanal bağlantısı kuruluyor...');
+
+          ws.send(JSON.stringify({
+            type: 'connect',
+            channel: 'simitciabdu'
+          }));
+        };
+
+        ws.onmessage = (event: MessageEvent) => {
+          if (stopped || socket !== ws) return;
+
+          try {
+            const payload = JSON.parse(String(event.data));
+            const eventName = payload?.event;
+            const data = payload?.data ?? {};
+
+            if (eventName === 'status') {
+              const state = String(data.state || '');
+
+              if (state === 'resolving') {
+                setKickConnected(false);
+                setKickConnectionMessage('Kick kanalı bulunuyor...');
+              } else if (state === 'discovering-connection') {
+                setKickConnected(false);
+                setKickConnectionMessage('Sohbet bağlantısı hazırlanıyor...');
+              } else if (state === 'socket-open') {
+                setKickConnected(false);
+                setKickConnectionMessage('Sohbet aboneliği bekleniyor...');
+              } else if (state === 'reconnecting') {
+                setKickConnected(false);
+                setKickConnectionMessage('Kick bağlantısı yenileniyor...');
+              }
+
+              return;
+            }
+
+            if (eventName === 'connected') {
+              reconnectDelay = 5000;
+              setKickConnected(true);
+              setKickConnectionMessage('Kick sohbet bağlantısı aktif.');
+              return;
+            }
+
+            if (eventName === 'message') {
+              // Mesajlar server.js içinde veritabanına kaydedilir.
+              // Burada tekrar kayıt yapmıyoruz; çift sayım önlenir.
+              setKickConnected(true);
+              setKickConnectionMessage('Kick sohbet bağlantısı aktif.');
+              return;
+            }
+
+            if (eventName === 'error') {
+              const message =
+                typeof data.message === 'string'
+                  ? data.message
+                  : 'Kick bağlantısında bir hata oluştu.';
+
+              setKickConnected(false);
+              setKickConnectionMessage(message);
+
+              console.error('[Kick]', message);
+            }
+
+            if (eventName === 'disconnected') {
+              setKickConnected(false);
+              setKickConnectionMessage('Kick bağlantısı kapandı.');
+            }
+          } catch (error) {
+            console.error('[Kick] Sunucu mesajı okunamadı:', error);
+          }
+        };
+
+        ws.onerror = () => {
+          if (stopped || socket !== ws) return;
+
+          setKickConnected(false);
+          setKickConnectionMessage(
+            'WebSocket bağlantı hatası. Sunucu ve Render loglarını kontrol et.'
+          );
+        };
+
+        ws.onclose = () => {
+          if (socket === ws) {
+            socket = null;
+          }
+
+          if (stopped) return;
+
+          setKickConnected(false);
+          scheduleReconnect();
+        };
+      } catch (error) {
+        setKickConnected(false);
+        setKickConnectionMessage(
+          error instanceof Error
+            ? error.message
+            : 'Kick bağlantısı kurulamadı.'
+        );
+
+        scheduleReconnect();
+      }
+    };
+
+    connect();
+
+    return () => {
+      stopped = true;
+      clearReconnectTimer();
+
+      const currentSocket = socket;
+      socket = null;
+
+      if (currentSocket) {
+        currentSocket.onopen = null;
+        currentSocket.onmessage = null;
+        currentSocket.onerror = null;
+        currentSocket.onclose = null;
+
+        if (currentSocket.readyState === WebSocket.OPEN) {
+          currentSocket.send(JSON.stringify({
+            type: 'disconnect'
+          }));
+        }
+
+        currentSocket.close();
+      }
+    };
+  }, []);
+
+  // Yoklama açıkken durumu ve katılımcıları düzenli yenile.
   useEffect(() => {
     if (tab !== 'liveAttendance' || !attendanceToken) return;
 
@@ -213,6 +414,7 @@ function App() {
 
     async function refreshAttendance() {
       if (busy) return;
+
       busy = true;
 
       try {
@@ -239,10 +441,15 @@ function App() {
         if (!alive) return;
 
         setAttendanceStatus(status);
-        setAttendanceUsers(Array.isArray(results.users) ? results.users : []);
+
+        setAttendanceUsers(
+          Array.isArray(results.users) ? results.users : []
+        );
+
         setAttendanceSessions(
           Array.isArray(history.sessions) ? history.sessions : []
         );
+
         setAttendanceLastUpdate(new Date().toLocaleTimeString('tr-TR'));
         setAttendanceError('');
       } catch (error) {
@@ -271,11 +478,19 @@ function App() {
   }, [tab, attendanceToken]);
 
   const viewers = useMemo<Viewer[]>(() => {
-    const monthPrefix = `${year}-${String(month + 1).padStart(2, '0')}-`;
+    const monthPrefix =
+      `${year}-${String(month + 1).padStart(2, '0')}-`;
 
     return records.map((record, index) => {
-      const name = String(record.name ?? record.username ?? 'Bilinmeyen kullanıcı');
-      const allDays = Array.isArray(record.days) ? record.days : [];
+      const name = String(
+        record.name ??
+        record.username ??
+        'Bilinmeyen kullanıcı'
+      );
+
+      const allDays = Array.isArray(record.days)
+        ? record.days
+        : [];
 
       const days = allDays
         .filter((day): day is string => typeof day === 'string')
@@ -295,7 +510,9 @@ function App() {
         color: colors[index % colors.length]
       };
     })
-      .filter(viewer => viewer.name.toLowerCase().includes(search.toLowerCase()))
+      .filter(viewer =>
+        viewer.name.toLowerCase().includes(search.toLowerCase())
+      )
       .sort((a, b) =>
         sort === 'streak' ? b.streak - a.streak :
         sort === 'days' ? b.days.length - a.days.length :
@@ -308,7 +525,9 @@ function App() {
     window.setTimeout(() => setToast(''), 2800);
   };
 
-  const loginAttendance = async (event: React.FormEvent<HTMLFormElement>) => {
+  const loginAttendance = async (
+    event: React.FormEvent<HTMLFormElement>
+  ) => {
     event.preventDefault();
 
     if (!attendancePassword.trim()) {
@@ -326,7 +545,9 @@ function App() {
         undefined,
         {
           method: 'POST',
-          body: JSON.stringify({ password: attendancePassword })
+          body: JSON.stringify({
+            password: attendancePassword
+          })
         }
       );
 
@@ -336,7 +557,9 @@ function App() {
       setAttendanceMessage('Giriş başarılı. Yoklama paneli açıldı.');
     } catch (error) {
       setAttendanceError(
-        error instanceof Error ? error.message : 'Giriş yapılamadı.'
+        error instanceof Error
+          ? error.message
+          : 'Giriş yapılamadı.'
       );
     } finally {
       setAttendanceLoginLoading(false);
@@ -362,7 +585,9 @@ function App() {
       notify('Yoklama başladı.');
     } catch (error) {
       setAttendanceError(
-        error instanceof Error ? error.message : 'Yoklama başlatılamadı.'
+        error instanceof Error
+          ? error.message
+          : 'Yoklama başlatılamadı.'
       );
     } finally {
       setAttendanceBusy(false);
@@ -394,7 +619,9 @@ function App() {
       notify('Yoklama bitirildi.');
     } catch (error) {
       setAttendanceError(
-        error instanceof Error ? error.message : 'Yoklama bitirilemedi.'
+        error instanceof Error
+          ? error.message
+          : 'Yoklama bitirilemedi.'
       );
     } finally {
       setAttendanceBusy(false);
@@ -408,35 +635,60 @@ function App() {
     setAttendanceMessage('');
     setAttendanceUsers([]);
     setAttendanceSessions([]);
+
     setAttendanceStatus({
       active: false,
       sessionId: null,
       startedAt: null,
       count: 0
     });
+
     notify('Yoklama panelinden çıkış yapıldı.');
   };
 
   const downloadCsv = () => {
     const rows = [
-      ['Kullanıcı', 'Bu ay katılım günü', 'Mevcut streak', 'En uzun streak', 'Mesaj sayısı', 'Son görülme'],
+      [
+        'Kullanıcı',
+        'Bu ay katılım günü',
+        'Mevcut streak',
+        'En uzun streak',
+        'Mesaj sayısı',
+        'Son görülme'
+      ],
       ...viewers.map(v => [
-        v.name, String(v.days.length), String(v.streak),
-        String(v.best), String(v.messages), v.last
+        v.name,
+        String(v.days.length),
+        String(v.streak),
+        String(v.best),
+        String(v.messages),
+        v.last
       ])
     ];
 
     const csv = '\uFEFF' + rows
-      .map(row => row.map(value => `"${value.replaceAll('"', '""')}"`).join(';'))
+      .map(row =>
+        row.map(value =>
+          `"${value.replaceAll('"', '""')}"`
+        ).join(';')
+      )
       .join('\n');
 
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const blob = new Blob(
+      [csv],
+      { type: 'text/csv;charset=utf-8;' }
+    );
+
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
+
     link.href = url;
-    link.download = `yoklama-${year}-${String(month + 1).padStart(2, '0')}.csv`;
+    link.download =
+      `yoklama-${year}-${String(month + 1).padStart(2, '0')}.csv`;
+
     link.click();
     URL.revokeObjectURL(url);
+
     notify('CSV dosyası hazırlandı.');
   };
 
@@ -449,17 +701,27 @@ function App() {
 
     const csv = '\uFEFF' + rows
       .map(row =>
-        row.map(value => `"${value.replaceAll('"', '""')}"`).join(';')
+        row.map(value =>
+          `"${value.replaceAll('"', '""')}"`
+        ).join(';')
       )
       .join('\n');
 
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const blob = new Blob(
+      [csv],
+      { type: 'text/csv;charset=utf-8;' }
+    );
+
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
+
     link.href = url;
-    link.download = `yoklama-katilimcilari-${new Date().toISOString().slice(0, 10)}.csv`;
+    link.download =
+      `yoklama-katilimcilari-${new Date().toISOString().slice(0, 10)}.csv`;
+
     link.click();
     URL.revokeObjectURL(url);
+
     notify('Katılımcı listesi indirildi.');
   };
 
@@ -474,15 +736,20 @@ function App() {
 
   const shiftMonth = (delta: number) => {
     const date = new Date(year, month + delta, 1);
+
     setMonth(date.getMonth());
     setYear(date.getFullYear());
   };
 
   const totalMessages = records.reduce(
-    (sum, record) => sum + (Number(record.messages) || 0), 0
+    (sum, record) => sum + (Number(record.messages) || 0),
+    0
   );
 
-  const currentMonthDays = viewers.reduce((sum, viewer) => sum + viewer.days.length, 0);
+  const currentMonthDays = viewers.reduce(
+    (sum, viewer) => sum + viewer.days.length,
+    0
+  );
 
   return (
     <div className="app-shell">
@@ -556,7 +823,10 @@ function App() {
             <div className="brand-name">streak<span>.</span></div>
             <div className="brand-sub">VIEWER TRACKER</div>
           </div>
-          <button className="icon-button sidebar-close" onClick={() => setMobileNav(false)}>
+          <button
+            className="icon-button sidebar-close"
+            onClick={() => setMobileNav(false)}
+          >
             <X size={18} />
           </button>
         </div>
@@ -567,13 +837,18 @@ function App() {
             <strong>SimitciAbdu</strong>
             <span>Kick kanalı</span>
           </div>
-          <span className="status-dot" title={connectionError ? 'Bağlantı hatası' : 'Geçmiş bağlantısı'} />
+          <span
+            className="status-dot"
+            title={connectionError ? 'Bağlantı hatası' : kickConnectionMessage}
+          />
         </div>
 
         <div className="nav-label">ÇALIŞMA ALANI</div>
+
         <nav className="nav-list">
           {navItems.map(item => {
             const Icon = item.icon;
+
             return (
               <button
                 key={item.id}
@@ -585,9 +860,11 @@ function App() {
               >
                 <Icon size={18} />
                 <span>{item.label}</span>
+
                 {item.id === 'attendance' && (
                   <span className="nav-count">{viewers.length}</span>
                 )}
+
                 {item.id === 'liveAttendance' && attendanceStatus.active && (
                   <span className="nav-count">CANLI</span>
                 )}
@@ -601,38 +878,65 @@ function App() {
             <ShieldCheck size={17} />
             <span>Veriler yerel sohbet sunucusundan okunuyor.</span>
           </div>
-          <a className="kick-link" href="https://kick.com/simitciabdu" target="_blank" rel="noreferrer">
+
+          <a
+            className="kick-link"
+            href="https://kick.com/simitciabdu"
+            target="_blank"
+            rel="noreferrer"
+          >
             Kick kanalını aç
           </a>
+
           <div className="sidebar-foot">
             <span className="foot-dot" />
-            {connectionError ? 'Bağlantı hatası' : 'Geçmiş bağlantısı'}
+            {kickConnected
+              ? 'Kick canlı bağlantısı aktif'
+              : connectionError
+                ? 'Bağlantı hatası'
+                : 'Bağlantı kontrol ediliyor'}
           </div>
         </div>
       </aside>
 
-      {mobileNav && <button className="mobile-scrim" onClick={() => setMobileNav(false)} />}
+      {mobileNav && (
+        <button
+          className="mobile-scrim"
+          onClick={() => setMobileNav(false)}
+        />
+      )}
 
       <main className="main-content">
         <header className="topbar">
           <div className="topbar-left">
-            <button className="icon-button mobile-menu" onClick={() => setMobileNav(true)}>
+            <button
+              className="icon-button mobile-menu"
+              onClick={() => setMobileNav(true)}
+            >
               <MenuIcon />
             </button>
+
             <div className="breadcrumb">
               SimitciAbdu <ChevronRight size={14} />
               <span>{navItems.find(item => item.id === tab)?.label}</span>
             </div>
           </div>
+
           <div className="topbar-actions">
             <span className="preview-pill">
-              <span /> {connectionError ? 'BAĞLANTI HATASI' : 'GEÇMİŞ VERİSİ'}
+              <span />
+              {kickConnected
+                ? 'KICK CANLI'
+                : connectionError
+                  ? 'BAĞLANTI HATASI'
+                  : 'BAĞLANTI KONTROLÜ'}
             </span>
-            <button className="connect-button" onClick={() => notify(
-              connectionError
-                ? 'Sunucuyu ve Vite bağlantısını kontrol et.'
-                : 'Geçmiş sunucusu erişilebilir.'
-            )}>
+
+            <button
+              className="connect-button"
+              onClick={() => notify(kickConnectionMessage)}
+              title={kickConnectionMessage}
+            >
               <Activity size={16} /> Bağlantı durumu
             </button>
           </div>
@@ -644,7 +948,9 @@ function App() {
               <div className="notice-icon"><Activity size={18} /></div>
               <div>
                 <strong>Geçmiş verisi alınamadı</strong>
-                <p>{connectionError} Vite ve Node sunucularının açık olduğundan emin ol.</p>
+                <p>
+                  {connectionError} Vite ve Node sunucularının açık olduğundan emin ol.
+                </p>
               </div>
             </div>
           )}
@@ -656,38 +962,85 @@ function App() {
                 title={<>İzleyici <span className="title-gradient">takibi.</span></>}
                 subtitle="Sohbette mesaj yazan kullanıcıların katılım geçmişini takip et."
               />
+
               <div className="section-row">
                 <h2>Topluluk özeti</h2>
                 <span className="muted-small">{monthNames[month]} {year}</span>
               </div>
+
               <div className="stats-grid">
-                <StatCard label="Kayıtlı kullanıcı" value={fmt(records.length)} detail="Sohbette görülen hesaplar" icon={Users} />
-                <StatCard label="Bu ay katılım" value={fmt(currentMonthDays)} detail="Kullanıcı-gün toplamı" icon={CalendarDays} />
-                <StatCard label="Aktif streak" value={fmt(records.filter(r => Number(r.streak) > 0).length)} detail="Serisi bulunan kullanıcılar" icon={Flame} />
-                <StatCard label="Toplam mesaj" value={fmt(totalMessages)} detail="Sunucudaki kayıtlı mesajlar" icon={MessageCircle} />
+                <StatCard
+                  label="Kayıtlı kullanıcı"
+                  value={fmt(records.length)}
+                  detail="Sohbette görülen hesaplar"
+                  icon={Users}
+                />
+                <StatCard
+                  label="Bu ay katılım"
+                  value={fmt(currentMonthDays)}
+                  detail="Kullanıcı-gün toplamı"
+                  icon={CalendarDays}
+                />
+                <StatCard
+                  label="Aktif streak"
+                  value={fmt(records.filter(r => Number(r.streak) > 0).length)}
+                  detail="Serisi bulunan kullanıcılar"
+                  icon={Flame}
+                />
+                <StatCard
+                  label="Toplam mesaj"
+                  value={fmt(totalMessages)}
+                  detail="Sunucudaki kayıtlı mesajlar"
+                  icon={MessageCircle}
+                />
               </div>
 
               <section className="panel leaderboard-panel">
                 <div className="panel-header">
-                  <div><h2><Trophy size={18} /> Streak liderleri</h2><p>En uzun mevcut katılım serisi</p></div>
-                  <button className="text-button" onClick={() => setTab('streaks')}>Tüm sıralama <ChevronRight size={15} /></button>
+                  <div>
+                    <h2><Trophy size={18} /> Streak liderleri</h2>
+                    <p>En uzun mevcut katılım serisi</p>
+                  </div>
+
+                  <button
+                    className="text-button"
+                    onClick={() => setTab('streaks')}
+                  >
+                    Tüm sıralama <ChevronRight size={15} />
+                  </button>
                 </div>
+
                 {loading && <p>Geçmiş yükleniyor...</p>}
+
                 {!loading && viewers.length === 0 && (
-                  <p>Henüz kayıtlı kullanıcı yok. Kick sohbetinde mesaj geldikçe kayıtlar burada görünür.</p>
+                  <p>
+                    Henüz kayıtlı kullanıcı yok. Kick sohbetinde mesaj geldikçe kayıtlar burada görünür.
+                  </p>
                 )}
+
                 {viewers.slice(0, 10).map((viewer, index) => (
                   <div className="leader-row" key={viewer.id}>
                     <span className="rank-number">{index + 1}</span>
-                    <div className="avatar" style={{ '--avatar-color': viewer.color } as React.CSSProperties}>
+
+                    <div
+                      className="avatar"
+                      style={{ '--avatar-color': viewer.color } as React.CSSProperties}
+                    >
                       {viewer.name[0]?.toUpperCase()}
                     </div>
+
                     <strong>{viewer.name}</strong>
-                    <span className="leader-streak"><Flame size={14} /> {viewer.streak} gün</span>
+
+                    <span className="leader-streak">
+                      <Flame size={14} /> {viewer.streak} gün
+                    </span>
                   </div>
                 ))}
               </section>
-              <p className="disclaimer-line"><Activity size={15} /> Son başarılı güncelleme: {lastUpdate || 'Henüz yok'}</p>
+
+              <p className="disclaimer-line">
+                <Activity size={15} /> Son başarılı güncelleme: {lastUpdate || 'Henüz yok'}
+              </p>
             </>
           )}
 
@@ -697,63 +1050,117 @@ function App() {
                 eyebrow="KATILIM RAPORU"
                 title="Aylık yoklama."
                 subtitle="Kullanıcıların kayıtlı katılım günlerini incele ve dışa aktar."
-                action={<button className="primary-button" onClick={downloadCsv}><Download size={16} /> CSV indir</button>}
+                action={
+                  <button className="primary-button" onClick={downloadCsv}>
+                    <Download size={16} /> CSV indir
+                  </button>
+                }
               />
+
               <div className="table-toolbar">
                 <div className="month-picker">
-                  <button className="icon-button" onClick={() => shiftMonth(-1)}><ChevronLeft size={17} /></button>
+                  <button
+                    className="icon-button"
+                    onClick={() => shiftMonth(-1)}
+                  >
+                    <ChevronLeft size={17} />
+                  </button>
+
                   <strong>{monthNames[month]} {year}</strong>
-                  <button className="icon-button" onClick={() => shiftMonth(1)}><ChevronRight size={17} /></button>
+
+                  <button
+                    className="icon-button"
+                    onClick={() => shiftMonth(1)}
+                  >
+                    <ChevronRight size={17} />
+                  </button>
                 </div>
+
                 <div className="toolbar-right">
                   <div className="search-box">
                     <Search size={16} />
-                    <input value={search} onChange={e => setSearch(e.target.value)} placeholder="İzleyici ara..." />
+                    <input
+                      value={search}
+                      onChange={e => setSearch(e.target.value)}
+                      placeholder="İzleyici ara..."
+                    />
                   </div>
+
                   <span className="table-total">{viewers.length} izleyici</span>
                 </div>
               </div>
+
               <div className="panel table-panel">
                 <div className="table-scroll">
                   <table className="attendance-table">
                     <thead>
                       <tr>
                         <th className="sticky-name">İZLEYİCİ</th>
-                        {Array.from({ length: new Date(year, month + 1, 0).getDate() }, (_, i) => i + 1)
-                          .map(day => <th key={day}>{day}</th>)}
-                        <th>GÜN</th><th>STREAK</th>
+
+                        {Array.from(
+                          { length: new Date(year, month + 1, 0).getDate() },
+                          (_, i) => i + 1
+                        ).map(day => (
+                          <th key={day}>{day}</th>
+                        ))}
+
+                        <th>GÜN</th>
+                        <th>STREAK</th>
                       </tr>
                     </thead>
+
                     <tbody>
                       {viewers.map(viewer => (
                         <tr key={viewer.id}>
                           <td className="sticky-name">
-                            <button className="user-cell" onClick={() => setSelected(viewer)}>
-                              <span className="avatar tiny" style={{ '--avatar-color': viewer.color } as React.CSSProperties}>
+                            <button
+                              className="user-cell"
+                              onClick={() => setSelected(viewer)}
+                            >
+                              <span
+                                className="avatar tiny"
+                                style={{ '--avatar-color': viewer.color } as React.CSSProperties}
+                              >
                                 {viewer.name[0]?.toUpperCase()}
                               </span>
-                              <span><strong>{viewer.name}</strong><small>Son görülme {viewer.last}</small></span>
+
+                              <span>
+                                <strong>{viewer.name}</strong>
+                                <small>Son görülme {viewer.last}</small>
+                              </span>
                             </button>
                           </td>
-                          {Array.from({ length: new Date(year, month + 1, 0).getDate() }, (_, i) => i + 1)
-                            .map(day => {
-                              const attended = viewer.days.includes(day);
-                              return (
-                                <td key={day}>
-                                  <span className={`attendance-mark ${attended ? 'attended' : ''}`}>
-                                    {attended ? '✓' : ''}
-                                  </span>
-                                </td>
-                              );
-                            })}
+
+                          {Array.from(
+                            { length: new Date(year, month + 1, 0).getDate() },
+                            (_, i) => i + 1
+                          ).map(day => {
+                            const attended = viewer.days.includes(day);
+
+                            return (
+                              <td key={day}>
+                                <span className={`attendance-mark ${attended ? 'attended' : ''}`}>
+                                  {attended ? '✓' : ''}
+                                </span>
+                              </td>
+                            );
+                          })}
+
                           <td><strong>{viewer.days.length}</strong></td>
-                          <td><span className="streak-chip"><Flame size={12} />{viewer.streak}</span></td>
+
+                          <td>
+                            <span className="streak-chip">
+                              <Flame size={12} />{viewer.streak}
+                            </span>
+                          </td>
                         </tr>
                       ))}
                     </tbody>
                   </table>
                 </div>
+
                 {viewers.length === 0 && <p>Bu ay için kayıt bulunamadı.</p>}
+
                 <div className="table-foot">
                   <span><span className="legend-square checked" /> Katıldı</span>
                   <span><span className="legend-square" /> Katılmadı</span>
@@ -765,26 +1172,47 @@ function App() {
           {tab === 'liveAttendance' && (
             <div className="yv-page">
               <div className="yv-hero">
-                <div className="yv-eyebrow">SİMİTÇİABDU · ÖZEL KONTROL PANELİ</div>
-                <h1 className="yv-title">YOKLAMA <span className="yv-gradient">VAKTİ.</span></h1>
+                <div className="yv-eyebrow">
+                  SİMİTÇİABDU · ÖZEL KONTROL PANELİ
+                </div>
+
+                <h1 className="yv-title">
+                  YOKLAMA <span className="yv-gradient">VAKTİ.</span>
+                </h1>
+
                 <p className="yv-subtitle">
                   Yoklamayı başlat, Kick sohbetine mesaj yazan katılımcıları canlı takip et.
                   Her kullanıcı aynı oturumda yalnızca bir kez sayılır.
                 </p>
+
+                <div className="yv-muted" style={{ marginTop: 12 }}>
+                  <span className={kickConnected ? 'yv-live-dot' : 'yv-offline-dot'} />
+                  {kickConnectionMessage}
+                </div>
               </div>
 
               {!attendanceToken ? (
                 <div className="yv-layout">
                   <section className="yv-card">
-                    <div className="yv-lock"><LockKeyhole size={27} /></div>
+                    <div className="yv-lock">
+                      <LockKeyhole size={27} />
+                    </div>
+
                     <div className="yv-card-title">Yetkili girişi</div>
+
                     <p className="yv-muted">
                       Yoklama kontrol paneline erişmek için Render ortam değişkeninde
                       tanımladığın şifreyi gir.
                     </p>
 
                     <form onSubmit={loginAttendance}>
-                      <label htmlFor="attendance-password" className="yv-muted">Yoklama şifresi</label>
+                      <label
+                        htmlFor="attendance-password"
+                        className="yv-muted"
+                      >
+                        Yoklama şifresi
+                      </label>
+
                       <input
                         id="attendance-password"
                         className="yv-field"
@@ -795,20 +1223,30 @@ function App() {
                         placeholder="Şifreni gir..."
                         required
                       />
-                      <button className="yv-btn yv-primary" type="submit" disabled={attendanceLoginLoading}>
+
+                      <button
+                        className="yv-btn yv-primary"
+                        type="submit"
+                        disabled={attendanceLoginLoading}
+                      >
                         <LockKeyhole size={16} />
-                        {attendanceLoginLoading ? 'Kontrol ediliyor...' : 'Güvenli giriş'}
+                        {attendanceLoginLoading
+                          ? 'Kontrol ediliyor...'
+                          : 'Güvenli giriş'}
                       </button>
                     </form>
 
-                    {attendanceError && <div className="yv-error">{attendanceError}</div>}
+                    {attendanceError && (
+                      <div className="yv-error">{attendanceError}</div>
+                    )}
                   </section>
 
                   <section className="yv-card">
-                    <div className="yv-card-title"><ShieldCheck size={19} /> Nasıl çalışır?</div>
-                    <p className="yv-muted">
-                      1. Şifrenle giriş yap.
-                    </p>
+                    <div className="yv-card-title">
+                      <ShieldCheck size={19} /> Nasıl çalışır?
+                    </div>
+
+                    <p className="yv-muted">1. Şifrenle giriş yap.</p>
                     <p className="yv-muted">
                       2. Yoklama başlatıldığında sistem yeni mesajları izlemeye başlar.
                     </p>
@@ -818,8 +1256,12 @@ function App() {
                     <p className="yv-muted">
                       4. Bitirdiğinde yoklama sonucu veritabanında kalır.
                     </p>
+
                     <div className="yv-success" style={{ marginTop: 18 }}>
-                      <CheckCircle2 size={15} style={{ verticalAlign: 'middle', marginRight: 7 }} />
+                      <CheckCircle2
+                        size={15}
+                        style={{ verticalAlign: 'middle', marginRight: 7 }}
+                      />
                       Şifre, tarayıcıya veya veritabanına kaydedilmez.
                     </div>
                   </section>
@@ -829,15 +1271,26 @@ function App() {
                   <div className="yv-history-title">
                     <div>
                       <div className="yv-card-title">Yoklama kontrolü</div>
-                      <div className="yv-muted">Son güncelleme: {attendanceLastUpdate || 'Bekleniyor...'}</div>
+                      <div className="yv-muted">
+                        Son güncelleme: {attendanceLastUpdate || 'Bekleniyor...'}
+                      </div>
                     </div>
-                    <button className="yv-btn yv-neutral" onClick={logoutAttendance}>
+
+                    <button
+                      className="yv-btn yv-neutral"
+                      onClick={logoutAttendance}
+                    >
                       <LogOut size={15} /> Çıkış
                     </button>
                   </div>
 
-                  {attendanceError && <div className="yv-error">{attendanceError}</div>}
-                  {attendanceMessage && <div className="yv-success">{attendanceMessage}</div>}
+                  {attendanceError && (
+                    <div className="yv-error">{attendanceError}</div>
+                  )}
+
+                  {attendanceMessage && (
+                    <div className="yv-success">{attendanceMessage}</div>
+                  )}
 
                   <div className="yv-layout">
                     <section className="yv-card">
@@ -846,6 +1299,7 @@ function App() {
                           <Activity size={19} />
                           Canlı yoklama
                         </div>
+
                         <span className={`yv-status-chip ${attendanceStatus.active ? 'active' : ''}`}>
                           {attendanceStatus.active
                             ? <><span className="yv-live-dot" /> YOKLAMA AÇIK</>
@@ -856,9 +1310,12 @@ function App() {
                       <div className="yv-stat-grid">
                         <div className="yv-stat">
                           <div className="yv-stat-label">Katılımcı sayısı</div>
-                          <div className="yv-stat-value yv-gradient">{fmt(attendanceUsers.length)}</div>
+                          <div className="yv-stat-value yv-gradient">
+                            {fmt(attendanceUsers.length)}
+                          </div>
                           <div className="yv-stat-label">Benzersiz kullanıcı</div>
                         </div>
+
                         <div className="yv-stat">
                           <div className="yv-stat-label">Başlangıç saati</div>
                           <div className="yv-stat-value" style={{ fontSize: 23 }}>
@@ -868,6 +1325,7 @@ function App() {
                             {formatDate(attendanceStatus.startedAt)}
                           </div>
                         </div>
+
                         <div className="yv-stat">
                           <div className="yv-stat-label">Durum</div>
                           <div className="yv-stat-value" style={{ fontSize: 21 }}>
@@ -885,7 +1343,9 @@ function App() {
                             disabled={attendanceBusy}
                           >
                             <Play size={16} />
-                            {attendanceBusy ? 'İşleniyor...' : 'Yoklamayı başlat'}
+                            {attendanceBusy
+                              ? 'İşleniyor...'
+                              : 'Yoklamayı başlat'}
                           </button>
                         ) : (
                           <button
@@ -894,7 +1354,9 @@ function App() {
                             disabled={attendanceBusy}
                           >
                             <Square size={15} />
-                            {attendanceBusy ? 'İşleniyor...' : 'Yoklamayı bitir'}
+                            {attendanceBusy
+                              ? 'İşleniyor...'
+                              : 'Yoklamayı bitir'}
                           </button>
                         )}
 
@@ -921,7 +1383,10 @@ function App() {
 
                         {attendanceUsers.length === 0 ? (
                           <div className="yv-empty">
-                            <Users size={30} style={{ opacity: .45, marginBottom: 10 }} />
+                            <Users
+                              size={30}
+                              style={{ opacity: .45, marginBottom: 10 }}
+                            />
                             <div>Henüz katılımcı yok.</div>
                             <p className="yv-muted">
                               Yoklama açıkken Kick sohbetine mesaj yazan kullanıcılar burada görünür.
@@ -933,9 +1398,14 @@ function App() {
                               <div className="yv-user-avatar">
                                 {name.slice(0, 1).toUpperCase()}
                               </div>
+
                               <div className="yv-user-name">{name}</div>
+
                               <div className="yv-number">
-                                <CheckCircle2 size={14} style={{ verticalAlign: 'middle', marginRight: 4 }} />
+                                <CheckCircle2
+                                  size={14}
+                                  style={{ verticalAlign: 'middle', marginRight: 4 }}
+                                />
                                 Katıldı
                               </div>
                             </div>
@@ -948,6 +1418,7 @@ function App() {
                       <div className="yv-card-title">
                         <HistoryIcon size={19} /> Yoklama geçmişi
                       </div>
+
                       <p className="yv-muted">
                         Önceki yoklamaların başlangıç zamanları ve katılımcı sayıları.
                         Kayıtlar veritabanından okunur.
@@ -956,7 +1427,10 @@ function App() {
                       <div style={{ marginTop: 16 }}>
                         {attendanceSessions.length === 0 ? (
                           <div className="yv-empty">
-                            <Clock3 size={28} style={{ opacity: .45, marginBottom: 10 }} />
+                            <Clock3
+                              size={28}
+                              style={{ opacity: .45, marginBottom: 10 }}
+                            />
                             <div>Henüz geçmiş yoklama bulunmuyor.</div>
                           </div>
                         ) : (
@@ -966,6 +1440,7 @@ function App() {
                                 <div className="yv-session-date">
                                   {formatDate(session.started_at)}
                                 </div>
+
                                 <div className="yv-session-meta">
                                   Başlangıç: {formatTime(session.started_at)}
                                   {' · '}
@@ -974,6 +1449,7 @@ function App() {
                                     : `Bitiş: ${formatTime(session.stopped_at)}`}
                                 </div>
                               </div>
+
                               <div className="yv-session-count">
                                 {fmt(Number(session.total) || 0)} kişi
                               </div>
@@ -983,9 +1459,13 @@ function App() {
                       </div>
 
                       <div className="yv-success" style={{ marginTop: 20 }}>
-                        <ShieldCheck size={15} style={{ verticalAlign: 'middle', marginRight: 7 }} />
+                        <ShieldCheck
+                          size={15}
+                          style={{ verticalAlign: 'middle', marginRight: 7 }}
+                        />
                         Katılımcılar oturum başına kullanıcı adına göre tekilleştirilir.
                       </div>
+
                       <p className="yv-muted" style={{ marginTop: 14 }}>
                         Not: Bu yöntem sessizce izleyenleri değil, yoklama açıkken sohbete
                         mesaj atan kullanıcıları sayar. Yoklamayı başlatmadan önce Kick
@@ -1000,47 +1480,148 @@ function App() {
 
           {tab === 'streaks' && (
             <>
-              <PageHeading eyebrow="TOPLULUK LİDER TABLOSU" title="Streak sıralaması." subtitle="Katılım serilerini ve mesaj sayılarını karşılaştır." />
+              <PageHeading
+                eyebrow="TOPLULUK LİDER TABLOSU"
+                title="Streak sıralaması."
+                subtitle="Katılım serilerini ve mesaj sayılarını karşılaştır."
+              />
+
               <div className="ranking-controls">
-                <div className="search-box"><Search size={16} /><input value={search} onChange={e => setSearch(e.target.value)} placeholder="İzleyici ara..." /></div>
+                <div className="search-box">
+                  <Search size={16} />
+                  <input
+                    value={search}
+                    onChange={e => setSearch(e.target.value)}
+                    placeholder="İzleyici ara..."
+                  />
+                </div>
+
                 <div className="segmented">
-                  <button className={sort === 'streak' ? 'selected' : ''} onClick={() => setSort('streak')}>Mevcut streak</button>
-                  <button className={sort === 'days' ? 'selected' : ''} onClick={() => setSort('days')}>Katılım günleri</button>
-                  <button className={sort === 'messages' ? 'selected' : ''} onClick={() => setSort('messages')}>Mesajlar</button>
+                  <button
+                    className={sort === 'streak' ? 'selected' : ''}
+                    onClick={() => setSort('streak')}
+                  >
+                    Mevcut streak
+                  </button>
+
+                  <button
+                    className={sort === 'days' ? 'selected' : ''}
+                    onClick={() => setSort('days')}
+                  >
+                    Katılım günleri
+                  </button>
+
+                  <button
+                    className={sort === 'messages' ? 'selected' : ''}
+                    onClick={() => setSort('messages')}
+                  >
+                    Mesajlar
+                  </button>
                 </div>
               </div>
+
               <div className="panel ranking-panel">
-                <div className="ranking-head"><span>SIRA / İZLEYİCİ</span><span>STREAK</span><span>EN İYİ</span><span>MESAJ</span></div>
+                <div className="ranking-head">
+                  <span>SIRA / İZLEYİCİ</span>
+                  <span>STREAK</span>
+                  <span>EN İYİ</span>
+                  <span>MESAJ</span>
+                </div>
+
                 {viewers.map((viewer, index) => (
-                  <div className={`ranking-row ${index < 3 ? 'top-rank' : ''}`} key={viewer.id}>
+                  <div
+                    className={`ranking-row ${index < 3 ? 'top-rank' : ''}`}
+                    key={viewer.id}
+                  >
                     <div className="ranking-user">
-                      <span className={`ranking-position pos-${index + 1}`}>{String(index + 1).padStart(2, '0')}</span>
-                      <div className="avatar" style={{ '--avatar-color': viewer.color } as React.CSSProperties}>{viewer.name[0]?.toUpperCase()}</div>
-                      <div><strong>{viewer.name}</strong><small>{viewer.days.length} gün katılım · Son görülme {viewer.last}</small></div>
+                      <span className={`ranking-position pos-${index + 1}`}>
+                        {String(index + 1).padStart(2, '0')}
+                      </span>
+
+                      <div
+                        className="avatar"
+                        style={{ '--avatar-color': viewer.color } as React.CSSProperties}
+                      >
+                        {viewer.name[0]?.toUpperCase()}
+                      </div>
+
+                      <div>
+                        <strong>{viewer.name}</strong>
+                        <small>
+                          {viewer.days.length} gün katılım · Son görülme {viewer.last}
+                        </small>
+                      </div>
                     </div>
-                    <span className="ranking-current"><Flame size={15} />{sort === 'messages' ? fmt(viewer.messages) : sort === 'days' ? viewer.days.length : viewer.streak} {sort === 'messages' ? 'mesaj' : 'gün'}</span>
+
+                    <span className="ranking-current">
+                      <Flame size={15} />
+                      {sort === 'messages'
+                        ? fmt(viewer.messages)
+                        : sort === 'days'
+                          ? viewer.days.length
+                          : viewer.streak}
+                      {' '}
+                      {sort === 'messages' ? 'mesaj' : 'gün'}
+                    </span>
+
                     <span className="ranking-best">{viewer.best} gün</span>
                     <span className="ranking-messages">{fmt(viewer.messages)}</span>
                   </div>
                 ))}
-                {viewers.length === 0 && <p>Henüz sıralanacak kullanıcı yok.</p>}
+
+                {viewers.length === 0 && (
+                  <p>Henüz sıralanacak kullanıcı yok.</p>
+                )}
               </div>
             </>
           )}
 
           {tab === 'activity' && (
             <>
-              <PageHeading eyebrow="SOHBET GEÇMİŞİ" title="Aktivite akışı." subtitle="Kayıtlı kullanıcıları son görülme zamanına göre incele." />
+              <PageHeading
+                eyebrow="SOHBET GEÇMİŞİ"
+                title="Aktivite akışı."
+                subtitle="Kayıtlı kullanıcıları son görülme zamanına göre incele."
+              />
+
               <div className="panel timeline-panel">
-                <div className="panel-header"><div><h2>Son görülen kullanıcılar</h2><p>Sunucuda kayıtlı hesaplar</p></div></div>
-                {[...viewers].sort((a, b) => b.last.localeCompare(a.last)).map((viewer, index) => (
-                  <div className="timeline-row" key={viewer.id}>
-                    <div className="timeline-rail"><div className="timeline-dot" />{index < viewers.length - 1 && <div className="timeline-line" />}</div>
-                    <div className="avatar" style={{ '--avatar-color': viewer.color } as React.CSSProperties}>{viewer.name[0]?.toUpperCase()}</div>
-                    <div className="timeline-copy"><strong>{viewer.name}</strong><p>{viewer.messages} kayıtlı mesaj · Streak: <b>{viewer.streak} gün</b></p></div>
-                    <time>{viewer.last}</time>
+                <div className="panel-header">
+                  <div>
+                    <h2>Son görülen kullanıcılar</h2>
+                    <p>Sunucuda kayıtlı hesaplar</p>
                   </div>
-                ))}
+                </div>
+
+                {[...viewers]
+                  .sort((a, b) => b.last.localeCompare(a.last))
+                  .map((viewer, index) => (
+                    <div className="timeline-row" key={viewer.id}>
+                      <div className="timeline-rail">
+                        <div className="timeline-dot" />
+                        {index < viewers.length - 1 && (
+                          <div className="timeline-line" />
+                        )}
+                      </div>
+
+                      <div
+                        className="avatar"
+                        style={{ '--avatar-color': viewer.color } as React.CSSProperties}
+                      >
+                        {viewer.name[0]?.toUpperCase()}
+                      </div>
+
+                      <div className="timeline-copy">
+                        <strong>{viewer.name}</strong>
+                        <p>
+                          {viewer.messages} kayıtlı mesaj · Streak:{' '}
+                          <b>{viewer.streak} gün</b>
+                        </p>
+                      </div>
+
+                      <time>{viewer.last}</time>
+                    </div>
+                  ))}
+
                 {viewers.length === 0 && <p>Henüz aktivite kaydı yok.</p>}
               </div>
             </>
@@ -1048,21 +1629,72 @@ function App() {
 
           {tab === 'settings' && (
             <>
-              <PageHeading eyebrow="BAĞLANTI DURUMU" title="Kontrol paneli." subtitle="Yerel sunucu ve kayıt durumunu kontrol et." />
+              <PageHeading
+                eyebrow="BAĞLANTI DURUMU"
+                title="Kontrol paneli."
+                subtitle="Yerel sunucu ve kayıt durumunu kontrol et."
+              />
+
               <div className="panel settings-panel">
                 <div className="settings-title">
-                  <div className="settings-icon"><Activity size={18} /></div>
-                  <div><h2>Kick geçmiş bağlantısı</h2><p>Site her beş saniyede bir /history adresini kontrol eder.</p></div>
+                  <div className="settings-icon">
+                    <Activity size={18} />
+                  </div>
+
+                  <div>
+                    <h2>Kick geçmiş bağlantısı</h2>
+                    <p>
+                      Site her beş saniyede bir /history adresini kontrol eder.
+                    </p>
+                  </div>
                 </div>
+
                 <div className="connection-box">
                   <div className="connection-status">
-                    <span className={connectionError ? 'offline-dot' : 'foot-dot'} />
-                    <div><strong>{connectionError ? 'Bağlantı hatası' : 'Geçmiş endpoint durumu'}</strong><small>{connectionError || `Kayıtlı kullanıcı: ${records.length}`}</small></div>
+                    <span className={kickConnected ? 'foot-dot' : 'offline-dot'} />
+
+                    <div>
+                      <strong>
+                        {kickConnected
+                          ? 'Kick canlı bağlantısı aktif'
+                          : 'Kick bağlantısı kontrol ediliyor'}
+                      </strong>
+
+                      <small>{kickConnectionMessage}</small>
+                    </div>
                   </div>
-                  <button className="primary-button" onClick={() => window.location.reload()}>Yenile</button>
+
+                  <button
+                    className="primary-button"
+                    onClick={() => window.location.reload()}
+                  >
+                    Yenile
+                  </button>
                 </div>
-                <div className="setting-line"><div><strong>Son güncelleme</strong><p>{lastUpdate || 'Henüz başarılı istek yok'}</p></div></div>
-                <div className="setting-line"><div><strong>Önemli bilgi</strong><p>Bu sistem yalnızca sohbette mesaj atan hesapları kaydedebilir. Sessiz izleyiciler bu yöntemle belirlenemez.</p></div></div>
+
+                <div className="setting-line">
+                  <div>
+                    <strong>Son güncelleme</strong>
+                    <p>{lastUpdate || 'Henüz başarılı istek yok'}</p>
+                  </div>
+                </div>
+
+                <div className="setting-line">
+                  <div>
+                    <strong>Kayıtlı kullanıcı</strong>
+                    <p>{fmt(records.length)} kullanıcı</p>
+                  </div>
+                </div>
+
+                <div className="setting-line">
+                  <div>
+                    <strong>Önemli bilgi</strong>
+                    <p>
+                      Bu sistem yalnızca sohbette mesaj atan hesapları kaydedebilir.
+                      Sessiz izleyiciler bu yöntemle belirlenemez.
+                    </p>
+                  </div>
+                </div>
               </div>
             </>
           )}
@@ -1076,24 +1708,66 @@ function App() {
 
       {selected && (
         <div className="modal-backdrop" onClick={() => setSelected(null)}>
-          <div className="modal profile-modal" onClick={e => e.stopPropagation()}>
-            <button className="modal-close" onClick={() => setSelected(null)}><X size={18} /></button>
+          <div
+            className="modal profile-modal"
+            onClick={e => e.stopPropagation()}
+          >
+            <button
+              className="modal-close"
+              onClick={() => setSelected(null)}
+            >
+              <X size={18} />
+            </button>
+
             <div className="profile-head">
-              <div className="avatar profile-avatar" style={{ '--avatar-color': selected.color } as React.CSSProperties}>{selected.name[0]?.toUpperCase()}</div>
-              <div><h2>{selected.name}</h2><p>Kayıtlı kullanıcı profili</p></div>
+              <div
+                className="avatar profile-avatar"
+                style={{ '--avatar-color': selected.color } as React.CSSProperties}
+              >
+                {selected.name[0]?.toUpperCase()}
+              </div>
+
+              <div>
+                <h2>{selected.name}</h2>
+                <p>Kayıtlı kullanıcı profili</p>
+              </div>
             </div>
+
             <div className="profile-stats">
-              <div><strong>{selected.streak}</strong><span>Mevcut streak</span></div>
-              <div><strong>{selected.best}</strong><span>En iyi streak</span></div>
-              <div><strong>{selected.days.length}</strong><span>Bu ay katılım</span></div>
+              <div>
+                <strong>{selected.streak}</strong>
+                <span>Mevcut streak</span>
+              </div>
+
+              <div>
+                <strong>{selected.best}</strong>
+                <span>En iyi streak</span>
+              </div>
+
+              <div>
+                <strong>{selected.days.length}</strong>
+                <span>Bu ay katılım</span>
+              </div>
             </div>
-            <div className="profile-detail"><span>İlk görüldüğü</span><strong>{selected.joined}</strong></div>
-            <div className="profile-detail"><span>Toplam mesaj</span><strong>{fmt(selected.messages)}</strong></div>
+
+            <div className="profile-detail">
+              <span>İlk görüldüğü</span>
+              <strong>{selected.joined}</strong>
+            </div>
+
+            <div className="profile-detail">
+              <span>Toplam mesaj</span>
+              <strong>{fmt(selected.messages)}</strong>
+            </div>
           </div>
         </div>
       )}
 
-      {toast && <div className="toast"><Activity size={16} />{toast}</div>}
+      {toast && (
+        <div className="toast">
+          <Activity size={16} />{toast}
+        </div>
+      )}
     </div>
   );
 }
@@ -1102,7 +1776,12 @@ function MenuIcon() {
   return <span style={{ fontSize: 20, lineHeight: 1 }}>☰</span>;
 }
 
-function PageHeading({ eyebrow, title, subtitle, action }: {
+function PageHeading({
+  eyebrow,
+  title,
+  subtitle,
+  action
+}: {
   eyebrow: string;
   title: React.ReactNode;
   subtitle: string;
@@ -1110,13 +1789,23 @@ function PageHeading({ eyebrow, title, subtitle, action }: {
 }) {
   return (
     <div className="page-heading">
-      <div><div className="eyebrow">{eyebrow}</div><h1>{title}</h1><p>{subtitle}</p></div>
+      <div>
+        <div className="eyebrow">{eyebrow}</div>
+        <h1>{title}</h1>
+        <p>{subtitle}</p>
+      </div>
+
       {action && <div className="heading-action">{action}</div>}
     </div>
   );
 }
 
-function StatCard({ label, value, detail, icon: Icon }: {
+function StatCard({
+  label,
+  value,
+  detail,
+  icon: Icon
+}: {
   label: string;
   value: string;
   detail: string;
@@ -1124,9 +1813,16 @@ function StatCard({ label, value, detail, icon: Icon }: {
 }) {
   return (
     <div className="stat-card accent-purple">
-      <div className="stat-top"><span>{label}</span><div className="stat-icon"><Icon size={18} /></div></div>
+      <div className="stat-top">
+        <span>{label}</span>
+        <div className="stat-icon"><Icon size={18} /></div>
+      </div>
+
       <div className="stat-value">{value}</div>
-      <div className="stat-bottom"><span>{detail}</span></div>
+
+      <div className="stat-bottom">
+        <span>{detail}</span>
+      </div>
     </div>
   );
 }
